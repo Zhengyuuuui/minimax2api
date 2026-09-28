@@ -1,0 +1,764 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>minimaxcode2api</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --edge: #262a33;
+    --text: #e6e8ec;
+    --muted: #8b93a3;
+    --accent: #5b8cff;
+    --ok: #35b37e;
+    --warn: #d9a13b;
+    --bad: #e0566b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --edge: #e3e6eb;
+      --text: #1a1d23;
+      --muted: #6b7280;
+      --accent: #2f6bff;
+      --ok: #1c8a5c;
+      --warn: #a97a12;
+      --bad: #c93a4f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.55 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px; border-bottom: 1px solid var(--edge);
+    position: sticky; top: 0; background: var(--panel); z-index: 5;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header .spacer { flex: 1; }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; }
+  nav button {
+    background: none; border: 1px solid transparent; color: var(--muted);
+    padding: 5px 11px; border-radius: 7px; cursor: pointer; font: inherit;
+  }
+  nav button[aria-selected="true"] { color: var(--text); border-color: var(--edge); background: var(--bg); }
+  main { padding: 20px; max-width: 1180px; margin: 0 auto; }
+  section[hidden] { display: none; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 12px; padding: 16px; margin-bottom: 16px;
+  }
+  .panel h2 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+  .stat { background: var(--bg); border: 1px solid var(--edge); border-radius: 9px; padding: 11px 13px; }
+  .stat b { display: block; font-size: 21px; font-weight: 650; }
+  .stat span { color: var(--muted); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--edge); font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tr:last-child td { border-bottom: 0; }
+  code, kbd, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre {
+    background: var(--bg); border: 1px solid var(--edge); border-radius: 8px;
+    padding: 10px 12px; overflow: auto; max-height: 300px; font-size: 12px;
+  }
+  input, select, textarea {
+    background: var(--bg); border: 1px solid var(--edge); color: var(--text);
+    border-radius: 7px; padding: 6px 9px; font: inherit; width: 100%;
+  }
+  textarea { min-height: 92px; resize: vertical; font-family: ui-monospace, monospace; font-size: 12px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row > * { flex: 1 1 130px; }
+  button {
+    background: var(--accent); border: 0; color: #fff; border-radius: 7px;
+    padding: 7px 13px; cursor: pointer; font: inherit; white-space: nowrap;
+  }
+  button.ghost { background: none; border: 1px solid var(--edge); color: var(--text); }
+  button.small { padding: 3px 8px; font-size: 12px; }
+  button.danger { background: var(--bad); }
+  button[disabled] { opacity: .5; cursor: not-allowed; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 11px; border: 1px solid var(--edge); color: var(--muted); }
+  .pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+  .pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  .pill.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+  .flash {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 9px;
+    padding: 9px 15px; box-shadow: 0 8px 30px rgb(0 0 0 / .28); z-index: 20;
+  }
+  .flash.bad { border-color: var(--bad); }
+  .flash.ok { border-color: var(--ok); }
+  img.gallery { width: 86px; height: 86px; object-fit: cover; border-radius: 7px; border: 1px solid var(--edge); }
+  @media (max-width: 640px) {
+    main { padding: 12px; }
+    .row > * { flex: 1 1 100%; }
+  }
+</style>
+</head>
+<body>
+
+<header id="console-header">
+  <h1>minimaxcode2api</h1>
+  <nav id="nav">
+    <button data-view="dashboard" aria-selected="true">概览</button>
+    <button data-view="accounts">号池</button>
+    <button data-view="models">模型</button>
+    <button data-view="signin">签到</button>
+    <button data-view="audits">审计</button>
+    <button data-view="media">画廊</button>
+    <button data-view="settings">设置</button>
+  </nav>
+  <span class="spacer"></span>
+  <span id="conn" class="pill"></span>
+</header>
+
+<main id="console">
+
+  <section id="view-dashboard">
+    <div class="panel">
+      <h2>概览</h2>
+      <div class="grid" id="stats-grid"></div>
+    </div>
+    <div class="panel">
+      <h2>近期请求</h2>
+      <table>
+        <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>状态</th><th>耗时</th><th>Tokens</th><th>错误</th></tr></thead>
+        <tbody id="recent-audits"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="view-accounts" hidden>
+    <div class="panel">
+      <h2>浏览器登录</h2>
+      <p class="muted" style="margin-top:0">点一下跳转 MiniMax 登录页，登录完成后账号自动进池子，不用去 devtools 抄 <code>_token</code>。</p>
+      <div class="row">
+        <div><label>账号名称（可选）</label><input id="device-name" placeholder="例如：主号"></div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="device-start">开始登录</button></div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="device-cancel" class="ghost" hidden>取消</button></div>
+      </div>
+      <div id="device-status" style="margin-top:10px"></div>
+    </div>
+    <div class="panel">
+      <h2>手动导入 JWT</h2>
+      <label>每行一个 JWT（<code>_token</code> 的值），可选 JSON：</label>
+      <textarea id="import-box" placeholder='TOKEN1
+TOKEN2
+{"token":"TOKEN3","name":"备用"}'></textarea>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:0 0 auto"><label>分组</label><input id="import-group" placeholder="可选"></div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label>
+          <label style="font-weight:400"><input type="checkbox" id="import-discover" checked style="width:auto;vertical-align:middle"> 自动探测 userId / agentId</label>
+        </div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="import-btn">导入</button></div>
+      </div>
+      <p class="muted" style="font-size:12px;margin:8px 0 0">
+        探测会读取 <code>realUserID</code> 与 agent 列表，逐个账号约需 1-3 秒。<br>
+        目前只导入国际站（<code>agent.minimax.io</code>）；若本机不在海外，先在「设置」里填好 <code>proxy</code>，否则探测一定 401。
+      </p>
+    </div>
+    <div class="panel">
+      <h2>号池 <span id="account-count" class="muted"></span></h2>
+      <table>
+        <thead><tr>
+          <th>名称</th><th>区域</th><th>userId</th><th>agentId</th><th>状态</th>
+          <th>并发</th><th>成功/失败</th><th>积分</th><th>签到</th><th>操作</th>
+        </tr></thead>
+        <tbody id="accounts-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="view-models" hidden>
+    <div class="panel">
+      <h2>模型目录</h2>
+      <p class="muted" style="margin-top:0"><code>upstream</code> 是本地派发提示，不会发送给上游。</p>
+      <table>
+        <thead><tr><th>ID</th><th>名称</th><th>类型</th><th>派发</th><th>上游模型</th><th>请求数</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="models-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="view-signin" hidden>
+    <div class="panel">
+      <h2>每日签到</h2>
+      <div class="row">
+        <div><label>启用</label><input type="checkbox" id="signin-enabled" style="width:auto"></div>
+        <div><label>执行时间</label><input id="signin-time" placeholder="09:05" value="09:05"></div>
+        <div><label>账号间隔（秒）</label><input id="signin-gap" type="number" min="0" value="2"></div>
+        <div><label>&nbsp;</label><button id="signin-save">保存</button> <button id="signin-run" class="ghost">立即运行</button></div>
+      </div>
+      <p class="muted" style="font-size:12px;margin:10px 0 0" id="signin-status-line"></p>
+    </div>
+    <div class="panel">
+      <h2>最近一次运行</h2>
+      <div id="signin-last"></div>
+    </div>
+  </section>
+
+  <section id="view-audits" hidden>
+    <div class="panel">
+      <h2>审计</h2>
+      <div class="row">
+        <div><label>模型</label><input id="audit-model" placeholder="留空为全部"></div>
+        <div><label>结果</label><select id="audit-outcome"><option value="">全部</option><option value="ok">ok</option><option value="error">error</option></select></div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="audit-filter">筛选</button></div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="audit-clear" class="danger">清空</button></div>
+      </div>
+    </div>
+    <div class="panel">
+      <table>
+        <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>状态</th><th>耗时</th><th>Tokens</th><th></th></tr></thead>
+        <tbody id="audits-body"></tbody>
+      </table>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:0 0 auto"><button id="audit-prev" class="ghost">上一页</button></div>
+        <div class="muted" id="audit-page" style="text-align:center"></div>
+        <div style="flex:0 0 auto"><button id="audit-next" class="ghost">下一页</button></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-media" hidden>
+    <div class="panel">
+      <h2>画廊 <span id="media-size" class="muted"></span></h2>
+      <div id="gallery" class="grid" style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr))"></div>
+    </div>
+  </section>
+
+  <section id="view-settings" hidden>
+    <div class="panel">
+      <h2>运行设置</h2>
+      <p class="muted" style="margin-top:0">改动即时生效，无需重启。</p>
+      <div id="settings-form"></div>
+    </div>
+  </section>
+
+</main>
+
+<div id="flash" class="flash" hidden></div>
+
+<script>
+"use strict";
+
+/* ---------------------------------------------------------------- utilities */
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+const state = {
+  view: "dashboard",
+  audits: { offset: 0, limit: 50, total: 0, model: "", outcome: "" },
+  accounts: [],
+};
+
+function flash(message, kind = "ok") {
+  const node = $("#flash");
+  node.textContent = message;
+  node.className = "flash " + kind;
+  node.hidden = false;
+  clearTimeout(node._timer);
+  node._timer = setTimeout(() => { node.hidden = true; }, 2600);
+}
+
+async function api(path, options = {}) {
+  const headers = Object.assign({ "Content-Type": "application/json" }, options.headers);
+  const response = await fetch(path, Object.assign({}, options, { headers }));
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error((body && body.error && (body.error.message || body.error)) || response.statusText);
+  }
+  return body;
+}
+
+function timeAgo(isoString) {
+  if (!isoString) return "-";
+  const then = new Date(isoString).getTime();
+  if (!then) return "-";
+  const seconds = Math.round((Date.now() - then) / 1000);
+  if (seconds < 0) return "刚刚";
+  if (seconds < 60) return seconds + " 秒前";
+  if (seconds < 3600) return Math.round(seconds / 60) + " 分前";
+  if (seconds < 86400) return Math.round(seconds / 3600) + " 时前";
+  return Math.round(seconds / 86400) + " 天前";
+}
+
+function pill(text, kind = "") {
+  return `<span class="pill ${kind}">${text}</span>`;
+}
+
+function statusPill(status) {
+  const map = {
+    active: ["", "ok"],
+    cooldown: ["冷却中", "warn"],
+    disabled: ["已停用", ""],
+    invalid: ["已失效", "bad"],
+  };
+  const [label, kind] = map[status] || [status, ""];
+  return pill(label || status, kind);
+}
+
+function row(cells) {
+  return "<tr>" + cells.map((cell) => `<td>${cell}</td>`).join("") + "</tr>";
+}
+
+function show(view) {
+  state.view = view;
+  $$("#nav button").forEach((button) => {
+    button.setAttribute("aria-selected", String(button.dataset.view === view));
+  });
+  $$("main section").forEach((section) => { section.hidden = section.id !== "view-" + view; });
+  render();
+}
+
+function refreshConnection() {
+  $("#conn").textContent = "已连接";
+  $("#conn").className = "pill ok";
+}
+
+/* ------------------------------------------------------------------ actions */
+
+$("#nav").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-view]");
+  if (button) show(button.dataset.view);
+});
+
+/* ------------------------------------------------------------------ renderer */
+
+async function render() {
+  try {
+    if (state.view === "dashboard") return await renderDashboard();
+    if (state.view === "accounts") return await renderAccounts();
+    if (state.view === "models") return await renderModels();
+    if (state.view === "signin") return await renderSignin();
+    if (state.view === "audits") return await renderAudits();
+    if (state.view === "media") return await renderMedia();
+    if (state.view === "settings") return await renderSettings();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+}
+
+async function renderDashboard() {
+  const [stats, health] = await Promise.all([api("/admin/api/stats"), api("/health")]);
+  const totals = stats.totals || {};
+  const cards = [
+    ["总请求", totals.requests ?? 0],
+    ["成功", totals.successes ?? 0],
+    ["失败", totals.failures ?? 0],
+    ["平均延迟", (totals.avgLatencyMs ?? 0) + " ms"],
+    ["可用账号", (health.usableAccounts ?? 0) + " / " + (health.accounts ?? 0)],
+    ["今日签到", health.signinEnabled ? "已启用" : "已关闭"],
+  ];
+  $("#stats-grid").innerHTML = cards
+    .map(([label, value]) => `<div class="stat"><b>${value}</b><span>${label}</span></div>`)
+    .join("");
+
+  const trend = stats.trend || [];
+  const latest = trend[trend.length - 1];
+  const body = [
+    row(["今日", latest ? latest.requests ?? 0 : 0, latest ? latest.errors ?? 0 : 0, latest ? latest.tokens ?? 0 : 0]),
+    row(["近 14 天", trend.reduce((sum, day) => sum + (day.requests ?? 0), 0)]
+      .concat([trend.reduce((sum, day) => sum + (day.errors ?? 0), 0), trend.reduce((sum, day) => sum + (day.tokens ?? 0), 0)])),
+  ];
+  $("#recent-audits").innerHTML = body
+    .map((cells) => row([cells[0], cells[1], cells[2], cells[3]]))
+    .join("");
+}
+
+async function renderAccounts() {
+  state.accounts = await api("/admin/api/accounts");
+  $("#account-count").textContent = "(" + state.accounts.length + ")";
+  $("#accounts-body").innerHTML = state.accounts.map((account) => row([
+    `<b>${account.name || account.id.slice(0, 8)}</b>`,
+    account.region,
+    `<span class="mono">${account.userId || "-"}</span>`,
+    `<span class="mono">${account.agentID || "-"}</span>`,
+    statusPill(account.status),
+    `${account.inflight}/${account.maxConcurrent}`,
+    `${account.successCount}/${account.failCount}`,
+    account.credit ? account.credit.total : "-",
+    account.signinStatus || "-",
+    [
+      `<button class="ghost small" data-act="probe" data-id="${account.id}">探测</button>`,
+      `<button class="ghost small" data-act="${account.enabled ? "disable" : "enable"}" data-id="${account.id}">${account.enabled ? "停用" : "启用"}</button>`,
+      account.status === "invalid"
+        ? `<button class="ghost small" data-act="reset" data-id="${account.id}">恢复</button>`
+        : "",
+      `<button class="ghost small" data-act="credit" data-id="${account.id}">余额</button>`,
+      `<button class="danger small" data-act="delete" data-id="${account.id}">删除</button>`,
+    ].join(" "),
+  ])).join("");
+}
+
+async function renderModels() {
+  const models = await api("/admin/api/models");
+  $("#models-body").innerHTML = models.map((model) => row([
+    `<code>${model.id}</code>`,
+    model.name,
+    model.type,
+    `<code>${model.upstream}</code>`,
+    model.upstreamModel ? `<code>${model.upstreamModel}</code>` : `<span class="muted">-</span>`,
+    model.requests,
+    model.enabled ? pill("启用", "ok") : pill("停用", "bad"),
+    `<button class="ghost small" data-model-act="toggle" data-id="${model.id}">${model.enabled ? "停用" : "启用"}</button>`,
+  ])).join("");
+}
+
+async function renderSignin() {
+  const status = await api("/admin/api/signin");
+  const settings = await api("/admin/api/settings");
+  $("#signin-enabled").checked = Boolean(settings.signin && settings.signin.enabled);
+  $("#signin-time").value = (settings.signin ? settings.signin.hour : 9) + ":" + String(settings.signin ? settings.signin.minute : 5).padStart(2, "0");
+  $("#signin-gap").value = settings.signin ? settings.signin.gap_seconds : 2;
+  $("#signin-status-line").textContent = status.running
+    ? "正在运行…"
+    : "下次运行：" + (status.nextRunAt || "-");
+
+  const last = status.lastRun;
+  if (!last) {
+    $("#signin-last").innerHTML = '<p class="muted">还没有运行过。</p>';
+    return;
+  }
+  const counts = last.counts || {};
+  const items = (last.outcomes || []).map((outcome) => row([
+    outcome.accountName || outcome.accountId,
+    pill(outcome.status, outcome.status === "ok" ? "ok" : outcome.status === "failed" ? "bad" : "warn"),
+    `<span class="mono">${outcome.points ?? 0}</span>`,
+    `<span class="muted">${outcome.reason || ""}</span>`,
+  ]));
+  $("#signin-last").innerHTML =
+    `<p>${pill("ok " + (counts.ok || 0), "ok")} ${pill("already " + (counts.already || 0), "")} ` +
+    `${pill("skipped " + (counts.skipped || 0), "warn")} ${pill("failed " + (counts.failed || 0), "bad")} ` +
+    `${pill("unpaid " + (counts.unpaid || 0), "bad")} <span class="muted">${last.durationMs ?? 0} ms</span></p>` +
+    `<table><thead><tr><th>账号</th><th>结果</th><th>积分</th><th>说明</th></tr></thead><tbody>${items.join("")}</tbody></table>`;
+}
+
+async function renderAudits() {
+  const data = await api(
+    `/admin/api/audits?limit=${state.audits.limit}&offset=${state.audits.offset}` +
+    `&model=${encodeURIComponent(state.audits.model)}&outcome=${encodeURIComponent(state.audits.outcome)}`
+  );
+  state.audits.total = data.total || 0;
+  const items = data.items || [];
+  $("#audits-body").innerHTML = items.map((audit) => row([
+    timeAgo(audit.createdAt),
+    audit.model,
+    audit.accountName || "-",
+    pill(audit.outcome, audit.outcome === "ok" ? "ok" : "bad"),
+    audit.latencyMs + " ms",
+    `${audit.promptTokens}/${audit.completionTokens}`,
+    audit.error ? `<span class="muted">${audit.error}</span>` : "",
+  ])).join("") || row(['<td colspan="7" class="muted">没有记录</td>']);
+  const page = Math.floor(state.audits.offset / state.audits.limit) + 1;
+  const pages = Math.max(1, Math.ceil(state.audits.total / state.audits.limit));
+  $("#audit-page").textContent = `第 ${page} / ${pages} 页（共 ${state.audits.total} 条）`;
+  $("#audit-prev").disabled = state.audits.offset === 0;
+  $("#audit-next").disabled = state.audits.offset + state.audits.limit >= state.audits.total;
+}
+
+async function renderMedia() {
+  const items = await api("/admin/api/media");
+  const size = await api("/admin/api/media/size");
+  $("#media-size").textContent = items.length + " 项 / " + Math.round((size.bytes || 0) / 1024) + " KB";
+  $("#gallery").innerHTML = items.map((item) => `
+    <div>
+      <img class="gallery" src="${item.url}" alt="${item.prompt || ""}" loading="lazy">
+      <div class="muted" style="font-size:11px;margin-top:4px">${timeAgo(item.createdAt)} · ${item.model}</div>
+      <div class="muted" style="font-size:11px;word-break:break-all">${item.prompt ? item.prompt.slice(0, 60) : ""}</div>
+    </div>`).join("") || '<p class="muted">还没有素材。</p>';
+}
+
+const SETTING_LABELS = {
+  "upstream.base_url": "国际区 base_url",
+  "upstream.base_url_cn": "大陆区 base_url",
+  "upstream.stream_base_url": "stream base_url（留空自动推导）",
+  "upstream.proxy": "代理",
+  "upstream.screen_width": "屏幕宽",
+  "upstream.screen_height": "屏幕高",
+  "upstream.request_timeout_sec": "请求超时（秒）",
+  "routing.strategy": "调度策略",
+  "routing.max_attempts": "最多尝试账号数",
+  "routing.cooldown_base_sec": "冷却基数（秒）",
+  "routing.cooldown_max_sec": "冷却上限（秒）",
+  "routing.sticky_ttl_sec": "粘性 TTL（秒）",
+  "audit.retention_days": "审计保留天数",
+  "audit.max_records": "审计最大条数",
+  "media.auto_download": "自动下载素材",
+  "media.max_total_size_mb": "素材目录上限（MB）",
+};
+
+async function renderSettings() {
+  const settings = await api("/admin/api/settings");
+  const form = $("#settings-form");
+  form.innerHTML = "";
+  for (const [key, label] of Object.entries(SETTING_LABELS)) {
+    const section = key.split(".")[0];
+    const value = settings[section][key.split(".")[1]];
+    const isBool = typeof value === "boolean";
+    const input = isBool
+      ? `<input type="checkbox" data-setting="${key}" ${value ? "checked" : ""} style="width:auto">`
+      : `<input data-setting="${key}" value="${value ?? ""}" type="${typeof value === "number" ? "number" : "text"}">`;
+    form.insertAdjacentHTML("beforeend", `<label>${label}</label>${input}`);
+  }
+  form.insertAdjacentHTML("beforeend", `<button id="settings-save">保存</button>`);
+  $("#settings-save").addEventListener("click", async () => {
+    const payload = {};
+    $$("[data-setting]", form).forEach((input) => {
+      const [section, name] = input.dataset.setting.split(".");
+      payload[section] = payload[section] || {};
+      payload[section][name] = input.type === "checkbox" ? input.checked : input.value;
+    });
+    try {
+      await api("/admin/api/settings", { method: "POST", body: JSON.stringify(payload) });
+      flash("设置已保存");
+    } catch (err) {
+      flash(err.message, "bad");
+    }
+  });
+}
+
+/* -------------------------------------------------------------- interactions */
+
+let deviceTimer = null;
+let deviceId = null;
+
+$("#device-start").addEventListener("click", async () => {
+  const button = $("#device-start");
+  button.disabled = true;
+  $("#device-status").innerHTML = '<span class="muted">正在申请登录码…</span>';
+  try {
+    const session = await api("/admin/api/login-device", {
+      method: "POST",
+      body: JSON.stringify({ name: $("#device-name").value.trim() }),
+    });
+    deviceId = session.id;
+    $("#device-cancel").hidden = false;
+    renderDevice(session);
+    // The new tab is a popup from this click, so it is allowed; a link rendered
+    // later would not be.
+    window.open(session.verifyUrl, "_blank", "noopener");
+    if (deviceTimer) clearInterval(deviceTimer);
+    deviceTimer = setInterval(pollDevice, 2000);
+  } catch (err) {
+    $("#device-status").innerHTML = `<span class="pill bad">失败</span> <span class="muted">${err.message}</span>`;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#device-cancel").addEventListener("click", async () => {
+  if (!deviceId) return;
+  try {
+    renderDevice(await api(`/admin/api/login-device/${deviceId}`, { method: "DELETE" }));
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+});
+
+async function pollDevice() {
+  if (!deviceId) return;
+  let session;
+  try {
+    session = await api(`/admin/api/login-device/${deviceId}`);
+  } catch (err) {
+    stopPolling();
+    $("#device-status").innerHTML = `<span class="pill bad">失败</span> <span class="muted">${err.message}</span>`;
+    return;
+  }
+  renderDevice(session);
+  if (session.status !== "pending") {
+    stopPolling();
+    if (session.status === "authorized") {
+      flash("已登录：" + (session.accountName || session.accountId), "ok");
+      $("#device-name").value = "";
+      await renderAccounts();
+    } else {
+      flash(session.error || "登录未完成", "bad");
+    }
+  }
+}
+
+function stopPolling() {
+  if (deviceTimer) clearInterval(deviceTimer);
+  deviceTimer = null;
+  $("#device-cancel").hidden = true;
+}
+
+function renderDevice(session) {
+  const box = $("#device-status");
+  const code = `<code style="font-size:16px;letter-spacing:.08em">${session.userCode || "-"}</code>`;
+  const link = `<a href="${session.verifyUrl}" target="_blank" rel="noopener" style="color:var(--accent)">打开登录页</a>`;
+  const left = Math.max(0, Math.floor(session.expiresIn / 60) + ":" + String(session.expiresIn % 60).padStart(2, "0"));
+  const hints = {
+    expired: "码已过期，重新点「开始登录」。",
+    denied: "在登录页点了拒绝。",
+    canceled: "已取消。",
+    failed: "如果提示网络失败，先去「设置」里填 <code>proxy</code>：国际站锁海外出口，直连一定失败。",
+  };
+  const kind = { pending: "", authorized: "ok", expired: "warn", denied: "bad", canceled: "", failed: "bad" };
+  box.innerHTML = `
+    <div class="row" style="align-items:center">
+      <div style="flex:0 0 auto">${pill(session.status, kind[session.status] || "")}</div>
+      <div style="flex:0 0 auto">${code}</div>
+      <div style="flex:0 0 auto">${link}</div>
+      <div class="muted" style="flex:0 0 auto">${session.status === "pending" ? "剩余 " + left : ""}</div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:8px 0 0">
+      在新开的页面里登录，登录成功后会自动跳到确认页，点「授权 / 同意」即可。${session.error ? " " + session.error : ""}
+      ${session.accountName ? " 已导入：" + session.accountName : ""}
+      ${hints[session.status] || ""}
+    </p>`;
+}
+
+$("#import-btn").addEventListener("click", async () => {
+  const raw = $("#import-box").value.trim();
+  if (!raw) return flash("请粘贴至少一个 token", "bad");
+  // 目前只测国际站：大陆站(base_url_cn)的代码还在，但导入先固定 global。
+  const region = "global";
+  const group = $("#import-group").value.trim();
+  const discover = $("#import-discover").checked;
+  const entries = raw.split("\n").map((line) => line.trim()).filter(Boolean);
+  const body = entries.map((line) => {
+    if (line.startsWith("{")) {
+      const parsed = JSON.parse(line);
+      return Object.assign({ region: parsed.region || region, group: parsed.group || group }, parsed);
+    }
+    return { token: line, region, group };
+  });
+  $("#import-btn").disabled = true;
+  try {
+    const result = await api("/admin/api/accounts", { method: "POST", body: JSON.stringify(body) });
+    const failed = result.results.filter((item) => !item.ok);
+    flash(`导入 ${result.imported} 个${failed.length ? "，失败 " + failed.length + " 个：" + failed[0].reason : ""}`, failed.length ? "bad" : "ok");
+    if (result.imported) $("#import-box").value = "";
+    await renderAccounts();
+  } catch (err) {
+    flash(err.message, "bad");
+  } finally {
+    $("#import-btn").disabled = false;
+  }
+});
+
+$("#accounts-body").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-act]");
+  if (!button) return;
+  const { act, id } = button.dataset;
+  try {
+    if (act === "delete") {
+      await api("/admin/api/accounts", { method: "DELETE", body: JSON.stringify({ ids: [id] }) });
+      await renderAccounts();
+      return;
+    }
+    if (act === "probe" || act === "credit" || act === "reset") {
+      const result = await api(`/admin/api/accounts/${id}/${act}`, { method: "POST", body: "{}" });
+      flash(act === "credit"
+        ? `余额 ${result.total ?? 0}（套餐 ${result.planName || "-"}）`
+        : result.ok === false ? (result.error || "失败") : "成功", result.ok === false ? "bad" : "ok");
+      await renderAccounts();
+      return;
+    }
+    await api(`/admin/api/accounts/${id}/${act}`, { method: "POST", body: "{}" });
+    await renderAccounts();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+});
+
+$("#models-body").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-model-act]");
+  if (!button) return;
+  const models = await api("/admin/api/models");
+  const model = models.find((item) => item.id === button.dataset.id);
+  try {
+    await api(`/admin/api/models/${model.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled: !model.enabled }),
+    });
+    await renderModels();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+});
+
+$("#signin-save").addEventListener("click", async () => {
+  const [hour, minute] = $("#signin-time").value.split(":").map(Number);
+  try {
+    await api("/admin/api/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        signin: {
+          enabled: $("#signin-enabled").checked,
+          hour: Number.isFinite(hour) ? hour : 9,
+          minute: Number.isFinite(minute) ? minute : 5,
+          gap_seconds: Number($("#signin-gap").value || 0),
+        },
+      }),
+    });
+    flash("签到设置已保存");
+    await renderSignin();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+});
+
+$("#signin-run").addEventListener("click", async () => {
+  $("#signin-run").disabled = true;
+  try {
+    await api("/admin/api/signin/run", { method: "POST", body: "{}" });
+    flash("已触发一次签到");
+    await renderSignin();
+  } catch (err) {
+    flash(err.message, "bad");
+  } finally {
+    $("#signin-run").disabled = false;
+  }
+});
+
+$("#audit-filter").addEventListener("click", async () => {
+  state.audits.offset = 0;
+  state.audits.model = $("#audit-model").value.trim();
+  state.audits.outcome = $("#audit-outcome").value;
+  await renderAudits();
+});
+
+$("#audit-clear").addEventListener("click", async () => {
+  if (!confirm("清空所有审计记录？")) return;
+  try {
+    await api("/admin/api/audits", { method: "DELETE" });
+    await renderAudits();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+});
+
+$("#audit-prev").addEventListener("click", () => {
+  state.audits.offset = Math.max(0, state.audits.offset - state.audits.limit);
+  renderAudits();
+});
+
+$("#audit-next").addEventListener("click", () => {
+  if (state.audits.offset + state.audits.limit >= state.audits.total) return;
+  state.audits.offset += state.audits.limit;
+  renderAudits();
+});
+
+/* -------------------------------------------------------------------- start */
+
+show(state.view);
+refreshConnection();
+</script>
+</body>
+</html>
