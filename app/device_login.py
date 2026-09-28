@@ -46,12 +46,36 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
+from .records import REGION_CN, REGION_GLOBAL
 from .security import new_id
 
 CLIENT_ID = "mcode-public"
-DEVICE_CODE_URL = "https://account.minimax.io/oauth2/device/code"
-TOKEN_URL = "https://account.minimax.io/oauth2/token"
+# The scope and audience the desktop client's OAuth contract declares.  Sending
+# none of them is also accepted, but sending a *different* scope is refused with
+# invalid_scope, so the declared pair is the safe value to send.
+OAUTH_SCOPE = "agent.default"
+OAUTH_AUDIENCE = "agent-backend"
 DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+
+# The account service is per-region, and the token it issues is only usable
+# against that region's agent deployment.  From the desktop client's own origin
+# table: cn -> account.minimax.cn, en -> account.minimax.io.
+ACCOUNT_ORIGINS = {
+    REGION_CN: "https://account.minimax.cn",
+    REGION_GLOBAL: "https://account.minimax.io",
+}
+
+
+def origin_for(region: str) -> str:
+    return ACCOUNT_ORIGINS.get(region, ACCOUNT_ORIGINS[REGION_GLOBAL])
+
+
+def device_code_url(region: str) -> str:
+    return f"{origin_for(region)}/oauth2/device/code"
+
+
+def token_url(region: str) -> str:
+    return f"{origin_for(region)}/oauth2/token"
 
 # Session states.  ``authorized`` means the token arrived *and* the account landed
 # in the pool: a token that fails to import is a failure, not a success the console
@@ -148,6 +172,7 @@ class DeviceSession:
     verify_url: str
     expires_at: float
     interval: float
+    region: str = REGION_GLOBAL
     name: str = ""
     status: str = PENDING
     error: str = ""
@@ -162,6 +187,7 @@ class DeviceSession:
             "id": self.id,
             "status": self.status,
             "userCode": self.user_code,
+            "region": self.region,
             "verifyUrl": self.verify_url,
             "expiresIn": max(0, int(self.expires_at - time.time())),
             "polls": self.polls,
@@ -181,8 +207,15 @@ class DeviceLoginService:
 
     # ------------------------------------------------------------------ public
 
-    async def start(self, name: str = "") -> dict[str, Any]:
-        """Ask the server for a code pair and start waiting for its approval."""
+    async def start(self, name: str = "", region: str = REGION_GLOBAL) -> dict[str, Any]:
+        """Ask the requested region's account service for a code pair.
+
+        The region is chosen per login rather than set globally: the two
+        deployments have separate account databases, so the region decides both
+        which origin issues the token and which agent deployment will accept it.
+        """
+        if region not in ACCOUNT_ORIGINS:
+            region = REGION_GLOBAL
         self._evict()
         pending = sum(1 for session in self._sessions.values() if session.status == PENDING)
         if pending >= _MAX_PENDING:
@@ -190,11 +223,13 @@ class DeviceLoginService:
 
         verifier, challenge = pkce_pair()
         payload = await self._post(
-            DEVICE_CODE_URL,
+            device_code_url(region),
             json={
                 "client_id": CLIENT_ID,
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
+                "scope": OAUTH_SCOPE,
+                "audience": OAUTH_AUDIENCE,
             },
         )
         device_code = str(payload.get("device_code") or "")
@@ -212,6 +247,7 @@ class DeviceLoginService:
             # friends) would creep in as if they were load-bearing.  They are not.
             verify_url=str(payload.get("verification_uri_complete") or payload.get("verification_uri") or ""),
             expires_at=now + float(payload.get("expires_in") or 300),
+            region=region,
             # A server-issued 0 is a request to poll immediately, and the floor
             # below is a courtesy to the server; the ``or`` default would replace
             # the zero with our own number instead of clamping it.
@@ -287,7 +323,7 @@ class DeviceLoginService:
             session.polls += 1
             try:
                 payload = await self._post(
-                    TOKEN_URL,
+                    token_url(session.region),
                     data={
                         "client_id": CLIENT_ID,
                         "grant_type": DEVICE_GRANT_TYPE,
@@ -360,7 +396,9 @@ class DeviceLoginService:
                 return
 
             try:
-                account = await self._admin.import_device_token(token, session.name)
+                account = await self._admin.import_device_token(
+                    token, session.name, region=session.region
+                )
             except Exception as err:  # noqa: BLE001 - the reason belongs in the console
                 session.status = FAILED
                 session.error = _clip(str(err))

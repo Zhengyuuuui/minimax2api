@@ -262,17 +262,23 @@ class AdminService:
         await self.pool.note_saved(stored)
         return ImportResult(ok=True, id=stored.id, name=stored.name or stored.id)
 
-    async def import_device_token(self, token: str, name: str = "") -> dict[str, Any]:
+    async def import_device_token(
+        self, token: str, name: str = "", region: str = REGION_GLOBAL
+    ) -> dict[str, Any]:
         """Turn a freshly signed-in access token into a pool account.
 
         The account is stored as ``kind="oauth"``, which is what keeps the token
         out of the ``token`` query parameter and in an ``Authorization`` header.
         Storing it as an ordinary web token instead is the mistake that makes a
         working sign-in import look like an expired credential.
+
+        ``region`` is the region whose account service issued the token, and it
+        has to be stored with the account: the two deployments have separate
+        account databases, so a token is accepted by exactly one of them.
         """
-        item = AccountInput(
-            token=token.strip(), name=name.strip(), region=REGION_GLOBAL, kind=KIND_OAUTH
-        )
+        if region not in (REGION_CN, REGION_GLOBAL):
+            region = REGION_GLOBAL
+        item = AccountInput(token=token.strip(), name=name.strip(), region=region, kind=KIND_OAUTH)
         if not item.token:
             raise AdminError(502, "the sign-in returned no token")
         result = await self._import_one(item, discover=True)

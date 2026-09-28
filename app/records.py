@@ -8,6 +8,7 @@ account.
 
 from __future__ import annotations
 
+import calendar
 import json
 import time
 from dataclasses import dataclass, field
@@ -104,7 +105,7 @@ class Quota:
         if not isinstance(node, dict):
             return None
         return cls(
-            synced_at=_as_float(node.get("syncedAt")),
+            synced_at=_as_ts(node.get("syncedAt")),
             available=bool(node.get("available")),
             latency_ms=int(_as_float(node.get("latencyMs"))),
             plan=str(node.get("plan") or ""),
@@ -204,7 +205,7 @@ class Credit:
             purchased=int(_as_float(node.get("purchased"))),
             plan_name=str(node.get("planName") or ""),
             plan_type=int(_as_float(node.get("planType"))),
-            synced_at=_as_float(node.get("syncedAt")),
+            synced_at=_as_ts(node.get("syncedAt")),
         )
 
     def exhausted(self) -> bool:
@@ -568,6 +569,30 @@ def mask_token(token: str) -> str:
     if len(token) <= 12:
         return token[:4] + "***"
     return token[:10] + "…" + token[-6:]
+
+
+def _as_ts(value: Any) -> float:
+    """Read back a timestamp written by ``iso``.
+
+    ``to_json`` renders times as ISO strings, so a round trip has to parse that
+    form: feeding the string to a number parser yields zero, and a zero
+    ``syncedAt`` is what makes freshness checks think a reading is decades old.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0.0
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def _as_float(value: Any) -> float:

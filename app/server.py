@@ -214,7 +214,8 @@ def _register(app: FastAPI, state: AppState) -> None:
         """Begin a browser sign-in.  Answers a URL to click and a code to show."""
         body = await json_body(request)
         name = body.get("name") if isinstance(body, dict) else ""
-        return await state.device_login.start(str(name or ""))
+        region = body.get("region") if isinstance(body, dict) else ""
+        return await state.device_login.start(str(name or ""), str(region or ""))
 
     @app.get("/admin/api/login-device/{session_id}")
     async def login_device_status(session_id: str) -> Any:

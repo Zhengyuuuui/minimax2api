@@ -69,6 +69,27 @@ def test_form_encode_uses_plus_for_space():
     assert signing.form_encode("a+b") == "a%2Bb"
 
 
+def test_timestamps_round_trip_through_json():
+    """`to_json` renders times as ISO strings, so `from_json` has to parse them.
+
+    A number parser silently returns zero for an ISO date, and a zero `syncedAt`
+    makes every freshness check believe a reading is decades old — which is how a
+    just-fetched balance got displayed as stale.
+    """
+    from app.records import Credit, Quota
+
+    credit = Credit(total=776, synced_at=1759000000.0)
+    restored = Credit.from_json(credit.to_json())
+    assert restored is not None
+    assert abs(restored.synced_at - 1759000000.0) < 1.0
+    assert restored.total == 776
+
+    quota = Quota(synced_at=1759000000.0, available=True)
+    restored_quota = Quota.from_json(quota.to_json())
+    assert restored_quota is not None
+    assert abs(restored_quota.synced_at - 1759000000.0) < 1.0
+
+
 # ------------------------------------------------------------------ prompting
 
 
@@ -306,10 +327,10 @@ class _AdminStub:
     def __init__(self):
         self.imported = []
 
-    async def import_device_token(self, token, name=""):
+    async def import_device_token(self, token, name="", region="global"):
         if token == "bad":
             raise RuntimeError("the token carries no realUserID")
-        self.imported.append((token, name))
+        self.imported.append((token, name, region))
         return {"id": "acct-1", "name": name or "acct-1"}
 
 
@@ -359,7 +380,7 @@ def _start_payload() -> dict:
     }
 
 
-async def _flow(responses, name="", timeout=2.0, relax=True):
+async def _flow(responses, name="", timeout=2.0, relax=True, region="global"):
     """Start a login, run its poll task to a decision, return everything.
 
     One event loop for the whole scenario: the poll task is created inside
@@ -376,13 +397,43 @@ async def _flow(responses, name="", timeout=2.0, relax=True):
         device_login._TRANSIENT_STEP = 0.001
         device_login._MAX_INTERVAL = 0.002
     service, transport, admin = _service(responses)
-    public = await service.start(name)
+    public = await service.start(name, region)
     deadline = asyncio.get_event_loop().time() + timeout
     session = public
     while session["status"] == device_login.PENDING and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.02)
         session = service.get(public["id"])
     return service, transport, admin, public, session
+
+
+def test_device_code_origins_follow_the_region():
+    """The two deployments have separate account services.
+
+    From the desktop client's own origin table: cn -> account.minimax.cn,
+    en -> account.minimax.io.  A token is accepted by exactly one agent
+    deployment, so the region decides which service issues it.
+    """
+    assert device_login.device_code_url("cn") == "https://account.minimax.cn/oauth2/device/code"
+    assert device_login.token_url("cn") == "https://account.minimax.cn/oauth2/token"
+    assert device_login.device_code_url("global").startswith("https://account.minimax.io/")
+
+    # The declared OAuth contract, which is what the desktop client sends.
+    assert device_login.OAUTH_SCOPE == "agent.default"
+    assert device_login.OAUTH_AUDIENCE == "agent-backend"
+
+
+def test_cn_login_polls_the_cn_token_endpoint():
+    async def scenario():
+        # Only the start response is canned; the poll reuses the transport stub.
+        responses = [_start_payload(), {"error": "expired_token"}]
+        service, transport, _, _, _ = await _flow(responses, region="cn")
+        return transport
+
+    transport = asyncio.run(scenario())
+    assert transport.calls[0]["url"].startswith("https://account.minimax.cn/")
+    assert transport.calls[1]["url"].startswith("https://account.minimax.cn/oauth2/token")
+    assert transport.calls[0]["json"]["scope"] == device_login.OAUTH_SCOPE
+    assert transport.calls[0]["json"]["audience"] == device_login.OAUTH_AUDIENCE
 
 
 def test_pkce_challenge_is_s256_of_the_verifier():
@@ -443,7 +494,7 @@ def test_polling_survives_pending_then_imports():
     ]
     _, transport, admin, _, session = asyncio.run(_flow(responses, "主号"))
     assert session["status"] == device_login.AUTHORIZED
-    assert admin.imported == [("header.payload.sig", "主号")]
+    assert admin.imported == [("header.payload.sig", "主号", "global")]
     assert session["accountId"] == "acct-1"
 
     # The token request carries the verifier, not the challenge, and no app_id or

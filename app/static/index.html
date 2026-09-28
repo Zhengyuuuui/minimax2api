@@ -144,6 +144,10 @@
       <h2>浏览器登录</h2>
       <p class="muted" style="margin-top:0">点一下跳转 MiniMax 登录页，登录完成后账号自动进池子，不用去 devtools 抄 <code>_token</code>。</p>
       <div class="row">
+        <div><label>区域</label><select id="device-region">
+          <option value="global">海外（agent.minimax.io）</option>
+          <option value="cn">国内（agent.minimax.cn）</option>
+        </select></div>
         <div><label>账号名称（可选）</label><input id="device-name" placeholder="例如：主号"></div>
         <div style="flex:0 0 auto"><label>&nbsp;</label><button id="device-start">开始登录</button></div>
         <div style="flex:0 0 auto"><label>&nbsp;</label><button id="device-cancel" class="ghost" hidden>取消</button></div>
@@ -299,6 +303,13 @@ function pill(text, kind = "") {
   return `<span class="pill ${kind}">${text}</span>`;
 }
 
+function signinPill(status) {
+  const map = { ok: ["已签", "ok"], already: ["已签", "ok"], unpaid: ["未发放", "bad"],
+                failed: ["失败", "bad"], skipped: ["跳过", "warn"] };
+  const [label, kind] = map[status] || [status, ""];
+  return pill(label, kind);
+}
+
 function statusPill(status) {
   const map = {
     active: ["", "ok"],
@@ -389,8 +400,12 @@ async function renderAccounts() {
     statusPill(account.status),
     `${account.inflight}/${account.maxConcurrent}`,
     `${account.successCount}/${account.failCount}`,
-    account.credit ? account.credit.total : "-",
-    account.signinStatus || "-",
+    account.credit
+      ? account.credit.total
+      : `<button class="ghost small" data-act="credit" data-id="${account.id}">查余额</button>`,
+    account.signinStatus
+      ? signinPill(account.signinStatus)
+      : `<button class="ghost small" data-act="signin" data-id="${account.id}">查签到</button>`,
     [
       `<button class="ghost small" data-act="probe" data-id="${account.id}">探测</button>`,
       `<button class="ghost small" data-act="${account.enabled ? "disable" : "enable"}" data-id="${account.id}">${account.enabled ? "停用" : "启用"}</button>`,
@@ -542,7 +557,10 @@ $("#device-start").addEventListener("click", async () => {
   try {
     const session = await api("/admin/api/login-device", {
       method: "POST",
-      body: JSON.stringify({ name: $("#device-name").value.trim() }),
+      body: JSON.stringify({
+        name: $("#device-name").value.trim(),
+        region: $("#device-region").value,
+      }),
     });
     deviceId = session.id;
     $("#device-cancel").hidden = false;
@@ -662,11 +680,19 @@ $("#accounts-body").addEventListener("click", async (event) => {
       await renderAccounts();
       return;
     }
-    if (act === "probe" || act === "credit" || act === "reset") {
+    if (act === "probe" || act === "credit" || act === "reset" || act === "signin") {
       const result = await api(`/admin/api/accounts/${id}/${act}`, { method: "POST", body: "{}" });
-      flash(act === "credit"
-        ? `余额 ${result.total ?? 0}（套餐 ${result.planName || "-"}）`
-        : result.ok === false ? (result.error || "失败") : "成功", result.ok === false ? "bad" : "ok");
+      if (act === "credit") {
+        flash(result.ok === false
+          ? (result.error || "查询失败")
+          : `余额 ${result.total ?? 0}（套餐 ${result.planName || "-"}）`,
+          result.ok === false ? "bad" : "ok");
+      } else if (act === "signin") {
+        flash(`签到：${result.status || "?"}${result.reason ? " — " + result.reason : ""}`,
+              result.status === "ok" || result.status === "already" ? "ok" : "bad");
+      } else {
+        flash(result.ok === false ? (result.error || "失败") : "成功", result.ok === false ? "bad" : "ok");
+      }
       await renderAccounts();
       return;
     }
