@@ -453,10 +453,6 @@ function statusPill(status) {
   return pill(label || status, kind);
 }
 
-function statusPill(status) {
-// facts, not one.  The stored ``status`` is the last runtime verdict (active,
-// cooling down, refused).  ``renewable`` is whether there is any path back to a
-// fresh credential at all.
 // The status column answers "can this account still serve traffic", which is two
 // facts, not one.  The stored ``status`` is the last runtime verdict (active,
 // cooling down, refused).  ``renewable`` is whether there is any path back to a
