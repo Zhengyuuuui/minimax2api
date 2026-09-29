@@ -27,6 +27,7 @@ from typing import Any, Callable
 
 from . import upstream
 from .records import (
+    KIND_OAUTH,
     STATUS_ACTIVE,
     STATUS_COOLDOWN,
     STATUS_DISABLED,
@@ -100,6 +101,9 @@ class Pool:
         self._slots: dict[str, _Slot] = {}
         self._rotation = itertools.count()
         self._lock = asyncio.Lock()
+        # Set by server.py: a callable that renews one account's token on demand.
+        # Late-bound because the keeper needs the pool loaded to see accounts.
+        self.renewer: Any = None
 
     # -------------------------------------------------------------------- load
 
@@ -311,6 +315,42 @@ class Pool:
 
     async def _record_failure(self, lease: Lease, error: BaseException | None) -> None:
         if isinstance(error, upstream.InvalidCredential):
+            # A refused OAuth credential is usually just an expired one-hour
+            # token, so renewal gets a chance before retirement: an account that
+            # can be refreshed must not be retired, because retirement is manual
+            # and a pool that empties itself every hour is the failure this
+            # prevents.  Only if renewal fails is the credential treated as dead.
+            if lease.account.kind == KIND_OAUTH and self.renewer is not None:
+                try:
+                    renewed = await self.renewer(lease.account.id)
+                except Exception:  # noqa: BLE001 - a failed renewal falls through
+                    renewed = None
+                if renewed is not None and getattr(renewed, "ok", False):
+                    # The account row was rewritten by the renewer; pick it up so
+                    # the next routing decision sees the fresh token.
+                    await self.load()
+                    return
+                if renewed is not None and getattr(renewed, "transient", False):
+                    # The renewal could not even reach the network.  That says
+                    # nothing about the credential, so the account is cooled like
+                    # a rate-limited one instead of retired: a proxy outage must
+                    # not empty the pool.
+                    def cool_transient(account: Account) -> None:
+                        routing = self._settings_fn().routing
+                        steps = min(account.fail_count, _BACKOFF_STEPS)
+                        seconds = min(
+                            float(routing.cooldown_max_sec),
+                            float(routing.cooldown_base_sec) * (2**steps),
+                        )
+                        account.fail_count += 1
+                        account.status = STATUS_COOLDOWN
+                        account.cooldown_until = time.time() + seconds
+                        account.last_error = _short(error)
+                        account.updated_at = time.time()
+
+                    await self._mutate(lease.account.id, cool_transient)
+                    return
+
             # A credential the upstream refused is the one failure that does not
             # recover, so the account is retired rather than cooled.
             def retire(account: Account) -> None:

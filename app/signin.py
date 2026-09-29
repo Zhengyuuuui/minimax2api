@@ -78,7 +78,7 @@ class Outcome:
     status: str = SIGNIN_SKIPPED
     reason: str = ""
     points: int = 0
-    total: int = 0
+    total: float = 0.0
     day_no: int = 0
 
     def to_json(self) -> dict[str, Any]:
@@ -128,10 +128,12 @@ class SigninService:
         self._client = client
         self._settings_fn = settings_fn
         self._task: asyncio.Task[None] | None = None
+        self._credit_task: asyncio.Task[None] | None = None
         self._wakeup = asyncio.Event()
         self._running = False
         self._last_run: dict[str, Any] | None = None
         self._next_run_at: float = 0.0
+        self._last_credit_run: dict[str, Any] | None = None
 
     # --------------------------------------------------------------- lifecycle
 
@@ -140,6 +142,10 @@ class SigninService:
             return
         self._task = asyncio.create_task(self._loop(), name="minimaxcode2api-signin")
         self._schedule_next()
+        if self._credit_task is None:
+            self._credit_task = asyncio.create_task(
+                self._credit_loop(), name="minimaxcode2api-credits"
+            )
 
     async def stop(self) -> None:
         task, self._task = self._task, None
@@ -147,6 +153,13 @@ class SigninService:
             task.cancel()
             try:
                 await task
+            except asyncio.CancelledError:
+                pass
+        credit_task, self._credit_task = self._credit_task, None
+        if credit_task is not None:
+            credit_task.cancel()
+            try:
+                await credit_task
             except asyncio.CancelledError:
                 pass
 
@@ -203,6 +216,92 @@ class SigninService:
         run = await self.run_daily(account_ids)
         self._last_run = run.to_json()
         return self._last_run
+
+    # ------------------------------------------------------------- balance refresh
+
+    async def _credit_loop(self) -> None:
+        """Re-read stale balances on a short timer, forever.
+
+        Separate from the check-in schedule on purpose: check-in is a once-a-day,
+        risk-control-sensitive claim, while a balance is a cheap read that the
+        console shows as live.  Tying the two together is what leaves a signed-in
+        account displaying the zero it had at registration.
+        """
+        while True:
+            try:
+                interval = max(1, int(self._settings_fn().signin.credit_refresh_min)) * 60
+                await asyncio.sleep(interval)
+                self._last_credit_run = await self.refresh_credits()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - the loop must survive
+                self._last_credit_run = {
+                    "at": int(time.time()),
+                    "error": f"{type(err).__name__}: {err}",
+                }
+
+    async def refresh_credits(self, account_ids: list[str] | None = None) -> dict[str, Any]:
+        """Refresh every balance whose snapshot has gone stale.
+
+        Only stale accounts are read: a pool of twenty polled every five minutes
+        is twenty requests a cycle for numbers that mostly have not moved, and the
+        endpoints are the same risk-control surface the check-in uses.  A caller
+        that names accounts gets exactly those, freshness ignored — that is the
+        "refresh now" the console button needs.
+        """
+        settings = self._settings_fn().signin
+        horizon = max(1, int(settings.credit_refresh_min)) * 60
+        now = time.time()
+        wanted = {account_id for account_id in account_ids or []} if account_ids else None
+        accounts = await self._db.list_accounts()
+
+        refreshed, failed, skipped = 0, 0, 0
+        for account in accounts:
+            # Disabled accounts are refreshed too: an operator turns an account off
+            # to park it, not to make its balance lie, and the number on the
+            # console is what decides whether it is worth turning back on.
+            if account.region == REGION_CN:
+                skipped += 1
+                continue
+            if wanted is not None and account.id not in wanted:
+                continue
+            # A named account is always read, even if its snapshot is fresh: the
+            # caller asked for a live number, not a cached one.
+            if wanted is None:
+                fresh = account.credit is not None and now - account.credit.synced_at < horizon
+                if fresh:
+                    skipped += 1
+                    continue
+            try:
+                credit = await self._fetch_credit(
+                    upstream.credential_of(account), float(settings.timeout_sec)
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one account only
+                credit = None
+            if credit is None:
+                failed += 1
+            else:
+                await self._save(account, credit=credit)
+                refreshed += 1
+            # The same spacing as check-in: a burst of reads from one address is
+            # its own pattern, and there is no urgency behind a balance.
+            if settings.gap_seconds > 0:
+                await asyncio.sleep(settings.gap_seconds)
+
+        return {
+            "at": int(now),
+            "refreshed": refreshed,
+            "failed": failed,
+            "skipped": skipped,
+        }
+
+    def credit_status(self) -> dict[str, Any]:
+        return {
+            "intervalMin": max(1, int(self._settings_fn().signin.credit_refresh_min)),
+            "lastRun": self._last_credit_run,
+        }
 
     # ------------------------------------------------------------------- the run
 
@@ -276,6 +375,15 @@ class SigninService:
             outcome.reason = "already checked in today"
             outcome.day_no = panel.today.day_no if panel.today else 0
             outcome.points = panel.today.points if panel.today else 0
+            # Read the balance again even on an already-claimed day.  The console's
+            # check-in button is pressed precisely because the number looks wrong,
+            # and answering "already checked in" while still showing the stale
+            # figure is the same complaint again.  The points may have landed since
+            # the stored reading, or the reading may simply be old.
+            credit = await self._fetch_credit(credential, deadline)
+            if credit is not None:
+                await self._save(account, credit=credit)
+                outcome.total = credit.total
             return await _record_outcome(self._db, self._pool, account, outcome, panel=_panel_of(panel))
 
         claim = await asyncio.wait_for(self._client.signin_claim(credential), timeout=deadline)
@@ -294,6 +402,17 @@ class SigninService:
             outcome.reason = "claim succeeded but no credit grant arrived"
         else:
             outcome.status = SIGNIN_OK
+
+        # The balance was read before the claim, so without this the console keeps
+        # showing the number from before the points landed — the exact "I checked
+        # in and it still says the old figure" the operator notices.  A real claim
+        # or a duplicate both mean the membership may have moved, so both re-read.
+        if outcome.status in (SIGNIN_OK, SIGNIN_ALREADY):
+            credit = await self._fetch_credit(credential, deadline)
+            if credit is not None:
+                await self._save(account, credit=credit)
+                outcome.total = credit.total
+
         return await _record_outcome(self._db, self._pool, account, outcome, panel=_panel_of(claim.panel))
 
     # --------------------------------------------------------------- sub-steps

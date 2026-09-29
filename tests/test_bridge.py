@@ -238,6 +238,46 @@ def test_release_with_no_error_records_nothing():
     assert engine.account(lease.account.id).fail_count == 0
 
 
+def test_cancelled_request_returns_its_account_to_the_pool():
+    """A client hanging up must not pin the account at ``max_concurrent``.
+
+    The failure this guards against: the streaming request holds a lease, the
+    client disconnects, ``CancelledError`` unwinds past every ``except Exception``
+    in the failover loop, and the lease's ``inflight`` counter is never
+    decremented.  With a single account at ``max_concurrent=1`` the pool is then
+    saturated for the life of the process and every later request waits out the
+    capacity timeout before failing — a hang with no error to explain it.
+    """
+    from app import upstream
+
+    db, _ = _fake_pool_db(1)
+    holder = _SettingsHolder()
+    engine = pool.Pool(db, holder.settings)
+
+    async def scenario():
+        await engine.load()
+
+        class StuckClient:
+            async def completion(self, credential, options):
+                await asyncio.Future()  # never resolves; the request is cancelled
+
+        bridge = gateway.Gateway(db, engine, StuckClient(), None, holder.settings)
+        options = upstream.Options(text="hi", timeout=30.0, images=[])
+        trace = gateway.Trace()
+        task = asyncio.create_task(bridge._run(options, trace))
+        await asyncio.sleep(0.05)  # let it take the lease and block
+        assert engine.snapshot()[0]["inflight"] == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The account is free again, so the next turn can use it.
+        assert engine.snapshot()[0]["inflight"] == 0
+        lease = await engine.acquire()
+        await engine.release(lease, success=True)
+
+    asyncio.run(scenario())
+
+
 # ------------------------------------------------------------------- fixtures
 
 
@@ -327,10 +367,11 @@ class _AdminStub:
     def __init__(self):
         self.imported = []
 
-    async def import_device_token(self, token, name="", region="global"):
+    async def import_device_token(self, token, name="", region="global", **extra):
         if token == "bad":
             raise RuntimeError("the token carries no realUserID")
         self.imported.append((token, name, region))
+        self.last_extra = extra
         return {"id": "acct-1", "name": name or "acct-1"}
 
 
@@ -504,8 +545,6 @@ def test_polling_survives_pending_then_imports():
     assert token_call["data"]["grant_type"] == device_login.DEVICE_GRANT_TYPE
     assert token_call["data"]["code_verifier"]
     assert "app_id" not in token_call["data"] and "scope" not in token_call["data"]
-
-
 def test_start_sends_the_challenge_not_the_verifier():
     _, transport, _, _, _ = asyncio.run(_flow([_start_payload(), {"error": "expired_token"}]))
     body = transport.calls[0]
@@ -513,6 +552,35 @@ def test_start_sends_the_challenge_not_the_verifier():
     assert body["json"]["client_id"] == device_login.CLIENT_ID
     assert body["json"]["code_challenge_method"] == "S256"
     assert "code_verifier" not in json.dumps(body["json"])
+
+
+def test_device_login_imports_the_refresh_token_it_was_sent():
+    """A browser sign-in must not lose the refresh token.
+
+    The access token answers requests for an hour; the refresh token is the only
+    way back to a new one.  An account imported without it looks healthy and then
+    dies an hour later with no path back — which is exactly the "网页登录导入"
+    account that shows 不可续.
+    """
+    responses = [
+        _start_payload(),
+        {
+            "access_token": "header.payload.sig",
+            "refresh_token": "mmort_abc",
+            "expires_in": 3600,
+        },
+    ]
+    _, _, admin, _, session = asyncio.run(_flow(responses, "网页号"))
+    assert session["status"] == device_login.AUTHORIZED
+    assert admin.last_extra.get("refresh_token") == "mmort_abc"
+    assert admin.last_extra.get("expires_in") == 3600
+
+
+def test_find_refresh_token_reads_nested_envelopes():
+    assert device_login.find_refresh_token({"data": {"refreshToken": "r1"}}) == "r1"
+    assert device_login.find_refresh_token({"a": [{"refresh_token": "r2"}]}) == "r2"
+    assert device_login.find_refresh_token({"access_token": "only"}) == ""
+    assert device_login.find_expires_in({"data": {"expires_in": "3600"}}) == 3600.0
 
 
 def test_denied_and_expired_are_terminal_states():
@@ -678,3 +746,639 @@ def test_token_estimate_counts_cjk_as_one_token_each():
     assert gateway.estimate_tokens("abcd") == 1
     assert gateway.estimate_tokens("中") == 1
     assert gateway.estimate_tokens("中文") == 2
+
+
+# --------------------------------------------------------------------- proxies
+
+
+def test_proxy_scheme_normalises_socks5h():
+    """socks5h asks the proxy to resolve the name; httpx always does, so store socks5."""
+    from app import proxy
+
+    assert proxy.scheme_of("socks5h://u:p@1.2.3.4:1080") == "socks5"
+    assert proxy.scheme_of("SOCKS5://1.2.3.4:1080") == "socks5"
+    assert proxy.scheme_of("http://1.2.3.4:8080") == "http"
+    assert proxy.scheme_of("ftp://1.2.3.4:21") == ""
+
+
+def test_proxy_validity_needs_a_scheme_and_a_host():
+    """A port is optional (scheme default), a host is not."""
+    from app import proxy
+
+    assert proxy.is_valid("http://1.2.3.4:8080")
+    assert proxy.is_valid("socks5://user:pass@host.example:1080")
+    assert proxy.is_valid("http://1.2.3.4")  # default port
+    assert not proxy.is_valid("1.2.3.4:8080")  # no scheme
+    assert not proxy.is_valid("http://")  # no host
+    assert not proxy.is_valid("")
+    assert not proxy.is_valid("socks5://:1080")  # host empty
+
+
+def test_make_proxy_normalises_the_stored_url():
+    from app import proxy
+
+    entry = proxy.make_proxy("socks5h://u:p@1.2.3.4:1080")
+    assert entry.url == "socks5://u:p@1.2.3.4:1080"
+    assert entry.scheme == "socks5"
+    assert entry.id and entry.status == "unknown"
+
+
+def test_proxy_redact_hides_only_the_password():
+    from app import proxy
+
+    assert proxy.redact("socks5://user:secret@1.2.3.4:1080") == "socks5://user:***@1.2.3.4:1080"
+    assert proxy.redact("http://1.2.3.4:8080") == "http://1.2.3.4:8080"
+    assert proxy.redact("") == ""
+
+
+def test_selector_rotates_and_skips_dead_entries():
+    from app import proxy
+    from app.records import PROXY_BAD, PROXY_OK
+
+    a = proxy.make_proxy("http://1.1.1.1:1080")
+    b = proxy.make_proxy("http://2.2.2.2:1080")
+    c = proxy.make_proxy("http://3.3.3.3:1080")
+    b.status = PROXY_BAD  # a failed check is skipped
+    c.enabled = False  # a disabled one too
+
+    picker = proxy.Selector("rotate")
+    picks = [picker.pick([a, b, c]).id for _ in range(3)]
+    assert picks == [a.id, a.id, a.id]
+
+    assert picker.pick([b, c]) is None
+
+
+def test_selector_single_pins_the_first_usable():
+    from app import proxy
+    from app.records import PROXY_BAD
+
+    a = proxy.make_proxy("http://1.1.1.1:1080")
+    b = proxy.make_proxy("http://2.2.2.2:1080")
+    a.status = PROXY_BAD
+    picker = proxy.Selector("single")
+    assert picker.pick([a, b]).id == b.id
+
+
+def test_apply_result_keeps_the_fail_streak_honest():
+    from app import proxy
+    from app.proxy import CheckResult
+
+    entry = proxy.make_proxy("http://1.2.3.4:1080")
+    proxy.apply_result(entry, CheckResult(ok=True, exit_ip="9.9.9.9", country="US", latency_ms=120))
+    assert entry.status == "ok" and entry.exit_ip == "9.9.9.9" and entry.fail_count == 0
+
+    proxy.apply_result(entry, CheckResult(ok=False, error="timeout"))
+    assert entry.status == "bad" and entry.fail_count == 1
+    # A later success clears the streak, because "it failed twice then worked" is
+    # a working proxy, not a two-thirds-broken one.
+    proxy.apply_result(entry, CheckResult(ok=True, exit_ip="9.9.9.9"))
+    assert entry.fail_count == 0
+
+
+class _ProxyDBStub:
+    def __init__(self, proxies):
+        self._proxies = proxies
+        self.ip_counts = {}
+
+    async def list_proxies(self):
+        return list(self._proxies)
+
+    async def ip_usage(self, ip):
+        return self.ip_counts.get(ip, 0)
+
+    async def update_proxy(self, proxy_id, apply_fn):
+        for entry in self._proxies:
+            if entry.id == proxy_id:
+                apply_fn(entry)
+                return entry
+        return None
+
+    async def record_ip_use(self, ip):
+        self.ip_counts[ip] = self.ip_counts.get(ip, 0) + 1
+        return self.ip_counts[ip]
+
+
+def test_signup_picks_around_a_full_address():
+    """An address at its limit is skipped, not reused; the next entry is taken."""
+    from app import proxy, signup
+    from app.config import SignupSettings
+
+    used = proxy.make_proxy("http://1.1.1.1:1080")
+    used.exit_ip = "8.8.8.8"
+    fresh = proxy.make_proxy("http://2.2.2.2:1080")
+    fresh.exit_ip = "9.9.9.9"
+    db = _ProxyDBStub([used, fresh])
+    db.ip_counts["8.8.8.8"] = 3
+
+    settings = SignupSettings(per_ip_limit=3, use_proxies=True)
+    settings.proxy_strategy = "rotate"
+    service = signup.SignupService(None, None, lambda: _signup_holder(settings), db)
+
+    session = signup.SignupSession(id="s", region="global", settings=settings)
+    picked = asyncio.run(service._pick_proxy(session))
+    assert picked is not None and picked.id == fresh.id
+
+
+def _signup_holder(signup_settings):
+    class _Holder:
+        def __init__(self, signup):
+            self.signup = signup
+
+    return _Holder(signup_settings)
+
+
+def test_new_account_gets_a_check_in_after_registration():
+    """Registration is what creates the account; the claim is what funds it.
+
+    A freshly registered account sits at zero until the check-in endpoint is
+    called, and a zero account looks identical to a broken one.  So the signup
+    service runs the same check-in the console's manual button runs — and a
+    check-in failure must never fail the registration, because the account is
+    already in the pool and worth keeping either way.
+    """
+    from app import signin as signin_mod
+    from app import signup
+    from app.config import SignupSettings
+
+    class _DBStub:
+        def __init__(self):
+            self.accounts = {}
+
+        async def account_by_id(self, account_id):
+            return self.accounts.get(account_id)
+
+    class _SigninStub:
+        def __init__(self, *, fail=False):
+            self.calls = []
+            self.fail = fail
+
+        async def run_account(self, account):
+            self.calls.append(account.id)
+            if self.fail:
+                raise RuntimeError("check-in endpoint refused")
+            return signin_mod.Outcome(account_id=account.id, status="ok")
+
+    async def scenario(fail):
+        db = _DBStub()
+        account = type("A", (), {"id": "acct-1", "name": "mmx"})()
+        db.accounts["acct-1"] = account
+        signin = _SigninStub(fail=fail)
+        service = signup.SignupService(
+            None, None, lambda: _signup_holder(SignupSettings()), db, signin
+        )
+        session = signup.SignupSession(id="s", region="global", settings=SignupSettings())
+        await service._signin_new_account(session, {"id": "acct-1"})
+        return signin.calls
+
+    assert asyncio.run(scenario(False)) == ["acct-1"]
+    # A failure is swallowed: registration is not undone by a missed claim.
+    assert asyncio.run(scenario(True)) == ["acct-1"]
+
+
+def test_credit_refresh_reads_stale_but_not_fresh_accounts():
+    """The five-minute pass costs one read per stale account, no more.
+
+    A pool polled in full every cycle is a burst of requests against a
+    risk-control endpoint for numbers that mostly have not moved, so an account
+    whose snapshot is still fresh is skipped.  A named account is always read:
+    that is the console's "refresh now", which wants a live number.
+
+    Disabled accounts are read too.  An account is turned off to park it, not to
+    make its balance lie, and the number decides whether it is worth turning on.
+    """
+    import time as _time
+
+    from app import signin as signin_mod
+    from app.config import SigninSettings
+    from app.records import REGION_CN, STATUS_ACTIVE, Account, Credit
+
+    now = _time.time()
+
+    class _DB:
+        def __init__(self):
+            self.accounts = {
+                "fresh": Account(id="fresh", enabled=True, status=STATUS_ACTIVE,
+                                 credit=Credit(total=10, synced_at=now)),
+                "stale": Account(id="stale", enabled=True, status=STATUS_ACTIVE,
+                                 credit=Credit(total=20, synced_at=now - 3600)),
+                "never": Account(id="never", enabled=True, status=STATUS_ACTIVE),
+                # Disabled, but still worth a read: parked, not hidden.
+                "off": Account(id="off", enabled=False, status=STATUS_ACTIVE),
+                # The mainland deployment has no such endpoint to read.
+                "cn": Account(id="cn", enabled=True, status=STATUS_ACTIVE, region=REGION_CN),
+            }
+            self.saved = []
+
+        async def list_accounts(self):
+            return list(self.accounts.values())
+
+        async def save_account_state(self, account_id, apply_fn):
+            account = self.accounts[account_id]
+            apply_fn(account)
+            self.saved.append(account_id)
+            return account
+
+    class _Client:
+        def __init__(self):
+            self.reads = []
+
+        async def credit(self, credential):
+            self.reads.append(credential.token)
+
+            class _Info:
+                total = 999.0
+                free = 999.0
+                purchased = 0.0
+                plan_name = ""
+                plan_type = 1
+
+            return _Info()
+
+    settings = SigninSettings(credit_refresh_min=5, gap_seconds=0)
+
+    class _Holder:
+        signin = settings
+
+    db = _DB()
+    client = _Client()
+
+    class _Pool:
+        async def note_saved(self, account):
+            return None
+
+    service = signin_mod.SigninService(db, _Pool(), client, lambda: _Holder())
+
+    summary = asyncio.run(service.refresh_credits())
+    assert summary["refreshed"] == 3  # stale + never + disabled
+    assert summary["skipped"] == 2  # fresh + cn
+    assert set(db.saved) == {"stale", "never", "off"}
+    assert db.accounts["fresh"].credit.total == 10  # untouched
+
+    # A named account is read even though its snapshot is fresh.
+    db.saved.clear()
+    asyncio.run(service.refresh_credits(["fresh"]))
+    assert db.saved == ["fresh"]
+
+
+def test_signin_rereads_balance_after_a_successful_claim():
+    """The balance is read before the claim, so it must be read again after.
+
+    Otherwise the console keeps showing the pre-claim figure and the account
+    looks like the check-in did nothing.
+    """
+    from app import signin as signin_mod
+    from app import upstream
+    from app.config import SigninSettings
+    from app.records import STATUS_ACTIVE, Account
+
+    class _DB:
+        def __init__(self):
+            self.account = Account(id="a", enabled=True, status=STATUS_ACTIVE)
+
+        async def save_account_state(self, account_id, apply_fn):
+            apply_fn(self.account)
+            return self.account
+
+        async def account_by_id(self, account_id):
+            return self.account
+
+    class _Pool:
+        async def note_saved(self, account):
+            return None
+
+    class _Client:
+        def __init__(self):
+            self.credit_calls = 0
+
+        async def prepare(self, credential):
+            class _P:
+                agents = []
+
+                def resolve_agent_id(self, current):
+                    return current, False
+
+            return _P()
+
+        async def signin_status(self, credential):
+            return upstream.SigninPanel(
+                scene=1,
+                days=[upstream.SigninDay(day_no=1, points=800, status=2, is_today=True)],
+            )
+
+        async def signin_claim(self, credential):
+            return upstream.SigninClaim(claim_id=1, result=1, day_no=1, points=800)
+
+        async def credit_grants(self, credential):
+            import time as _t
+
+            # A grant that just arrived, so the claim counts as paid rather than
+            # "unpaid" (the endpoint's success is not itself proof).
+            return [
+                upstream.CreditGrant(
+                    granted_at=int(_t.time() * 1000),
+                    expires_at=0,
+                    granted=800.0,
+                    remaining=800.0,
+                )
+            ]
+
+        async def credit(self, credential):
+            self.credit_calls += 1
+
+            class _Info:
+                total = 1600
+                free = 1600
+                purchased = 0
+                plan_name = ""
+                plan_type = 1
+
+            return _Info()
+
+    class _Holder:
+        signin = SigninSettings(timeout_sec=5, gap_seconds=0)
+
+    db = _DB()
+    client = _Client()
+    service = signin_mod.SigninService(db, _Pool(), client, lambda: _Holder())
+    outcome = asyncio.run(service.run_account(db.account))
+
+    assert outcome.status == signin_mod.SIGNIN_OK
+    # Read once before the claim, once after to pick up the points.
+    assert client.credit_calls == 2
+    assert db.account.credit.total == 1600
+
+
+# -------------------------------------------------------- env config + masking
+
+
+def test_env_parses_dotenv_and_lets_real_vars_win(tmp_path):
+    from app import env
+
+    path = tmp_path / ".env"
+    path.write_text(
+        "# a comment\nexport MINIMAX2API_SIGNUP__MAIL_DOMAIN=\"quoted.example\"\n"
+        "MINIMAX2API_SIGNUP__MAIL_PASS='single-quoted'\nPLAIN=value\n",
+        encoding="utf-8",
+    )
+    parsed = env.load_dotenv(path)
+    assert parsed["MINIMAX2API_SIGNUP__MAIL_DOMAIN"] == "quoted.example"
+    assert parsed["MINIMAX2API_SIGNUP__MAIL_PASS"] == "single-quoted"
+    assert parsed["PLAIN"] == "value"
+
+    merged = env.environ(dotenv=path, refresh=True)
+    assert merged["MINIMAX2API_SIGNUP__MAIL_DOMAIN"] == "quoted.example"
+
+
+def test_env_applies_over_settings_and_reports_paths():
+    from app import config, env
+
+    settings = config.default_settings("./data")
+    applied = env.apply_env(
+        settings,
+        {
+            "MINIMAX2API_SIGNUP__MAIL_PASS": "envsecret",
+            "MINIMAX2API_SIGNUP__PER_IP_LIMIT": "7",
+            "MINIMAX2API_SIGNUP__USE_PROXIES": "false",
+            "MINIMAX2API_UPSTREAM__PROXY": "http://1.2.3.4:8080",
+        },
+    )
+    assert settings.signup.mail_pass == "envsecret"
+    assert settings.signup.per_ip_limit == 7
+    assert settings.signup.use_proxies is False
+    assert settings.upstream.proxy == "http://1.2.3.4:8080"
+    assert "signup.mail_pass" in applied
+
+
+def test_env_refuses_a_bad_number_rather_than_zeroing_it():
+    """A zero would be indistinguishable from an intentional zero."""
+    from app import config, env
+
+    settings = config.default_settings("./data")
+    env.apply_env(settings, {"MINIMAX2API_SIGNUP__PER_IP_LIMIT": "not-a-number"})
+    assert settings.signup.per_ip_limit == 3
+
+
+def test_secrets_are_masked_and_flagged():
+    from app import config
+
+    settings = config.default_settings("./data")
+    settings.signup.mail_pass = "REAL"
+    settings.upstream.proxy = "socks5://u:p@1.2.3.4:1080"
+    view = config.to_dict_masked(settings, {"signup.mail_pass"})
+    assert view["signup"]["mail_pass"] == config.SECRET_MASK
+    assert view["upstream"]["proxy"] == config.SECRET_MASK
+    assert view["signup"]["mail_base"] == settings.signup.mail_base  # not a secret
+    assert set(view["_secrets"]) == {"signup.mail_pass", "upstream.proxy"}
+    assert view["_locked"] == ["signup.mail_pass"]
+
+
+def test_saving_the_mask_back_does_not_destroy_the_secret():
+    """The console round-trips the masked value on save."""
+    from app import config
+
+    settings = config.default_settings("./data")
+    settings.signup.mail_pass = "REAL"
+    config.apply_update(settings, {"signup": {"mail_pass": config.SECRET_MASK}})
+    assert settings.signup.mail_pass == "REAL"
+
+    # An explicit empty string is a clear, and is honoured.
+    config.apply_update(settings, {"signup": {"mail_pass": ""}})
+    assert settings.signup.mail_pass == ""
+
+
+def test_locked_fields_follow_the_prefixed_namespace():
+    from app import env
+
+    locked = env.locked_fields(
+        {
+            "MINIMAX2API_SIGNUP__MAIL_PASS": "x",
+            "MINIMAX2API_UPSTREAM__PROXY": "y",
+            "UNRELATED": "z",
+        }
+    )
+    assert locked == {"signup.mail_pass", "upstream.proxy"}
+
+
+# ------------------------------------------------- email/password on accounts
+
+
+def test_account_view_masks_the_password_and_exposes_the_email():
+    from app import config
+    from app.admin import AccountInput
+    from app.db import account_view
+    from app.records import KIND_OAUTH
+
+    item = AccountInput(
+        token="mmoat_x", name="n", kind=KIND_OAUTH, email="a@b.cc", password="s3cret"
+    )
+    account = item.account()
+    assert account.email == "a@b.cc"
+    assert account.password == "s3cret"
+
+    view = account_view(account, 0).to_json()
+    assert view["email"] == "a@b.cc"
+    # the plaintext password never rides along with the list
+    assert "password" not in view
+    assert view["passwordMasked"] == "•" * 8
+
+
+def test_mask_password_reports_presence_not_length():
+    from app.records import mask_password
+
+    assert mask_password("") == ""
+    assert mask_password("short") == "•" * 8
+    assert mask_password("a-very-long-password-indeed") == "•" * 8
+
+
+def test_old_database_gains_the_new_columns(tmp_path):
+    """CREATE TABLE IF NOT EXISTS does not add columns to a table that exists."""
+    import sqlite3
+
+    from app.db import _migrate
+
+    path = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE accounts (id TEXT PRIMARY KEY, identifier TEXT, user_id TEXT)"
+    )
+    _migrate(conn)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
+    assert "email" in columns and "password" in columns
+    # idempotent: running it again is not an error
+    _migrate(conn)
+    conn.close()
+
+
+# ------------------------------------------------------------------- keepalive
+
+
+def test_refresh_grant_posts_form_and_keeps_the_rotated_token():
+    """The refresh call is form-encoded and the server rotates the token."""
+    from app import keepalive
+
+    seen = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "access_token": "mmoat_new",
+                "expires_in": 3600,
+                "refresh_token": "mmort_new",
+                "token_type": "Bearer",
+            }
+
+    class _Client:
+        async def post(self, url, data=None, headers=None, timeout=None):
+            seen["url"] = url
+            seen["data"] = data
+            seen["headers"] = headers
+            return _Response()
+
+    result = asyncio.run(
+        keepalive.refresh_with_token(_Client(), "https://account.minimax.io", "mmort_old")
+    )
+    assert result.ok and result.method == "refresh"
+    assert result.token == "mmoat_new"
+    # rotation is stored, because keeping the old one works until it does not
+    assert result.refresh_token == "mmort_new"
+    assert seen["data"]["grant_type"] == "refresh_token"
+    assert seen["data"]["client_id"] == "mcode-public"
+    # app_id belongs to the browser's authorize call, not the token endpoint
+    assert "app_id" not in seen["data"]
+    assert seen["headers"]["content-type"] == "application/x-www-form-urlencoded"
+
+
+def test_refused_refresh_is_an_answer_not_a_transport_failure():
+    from app import keepalive
+
+    class _Response:
+        def json(self):
+            return {"error": "invalid_grant", "error_description": "refresh token expired"}
+
+    class _Client:
+        async def post(self, *a, **k):
+            return _Response()
+
+    result = asyncio.run(
+        keepalive.refresh_with_token(_Client(), "https://account.minimax.io", "mmort_dead")
+    )
+    assert not result.ok
+    assert not result.transient
+    assert "expired" in result.error
+
+
+def test_transport_failure_is_marked_transient():
+    """A network error must not read as a dead credential."""
+    import httpx
+
+    from app import keepalive
+
+    class _Client:
+        async def post(self, *a, **k):
+            raise httpx.ConnectError("proxy unreachable")
+
+    result = asyncio.run(
+        keepalive.refresh_with_token(_Client(), "https://account.minimax.io", "mmort_x")
+    )
+    assert not result.ok
+    assert result.transient
+
+
+def test_renew_without_credentials_reports_what_is_missing():
+    from app import keepalive
+    from app.records import KIND_OAUTH, Account
+
+    account = Account(kind=KIND_OAUTH, email="", password="")
+    from app.config import SignupSettings
+
+    result = asyncio.run(
+        keepalive.renew_with_password(None, account, SignupSettings())
+    )
+    assert not result.ok
+    assert "email/password" in result.error
+
+
+def test_sweep_skips_accounts_that_cannot_be_renewed(tmp_path):
+    """An unrenewable JWT is not a failure; it just has no path back."""
+    from app import keepalive, config
+    from app.records import Account, KIND_OAUTH, KIND_TOKEN
+
+    class _DB:
+        async def list_accounts(self):
+            return [
+                Account(id="a", kind=KIND_OAUTH, refresh_token="", email="", password=""),
+                Account(id="b", kind=KIND_TOKEN, region="global"),
+            ]
+
+    keeper = keepalive.Keeper(_DB(), None, lambda: config.default_settings("./data"))
+    summary = asyncio.run(keeper.sweep())
+    assert summary["skipped"] == 1   # the oauth one with no way to renew
+    assert summary["due"] == 0       # the token-kind account is not considered
+    assert summary["failed"] == 0    # and neither is reported as a failure
+
+
+def test_sweep_only_renews_enabled_accounts():
+    """A parked account is not spending tokens, so it is not renewed.
+
+    Renewing a disabled account spends a request from the same address on a
+    credential nobody is using, and pushes back the renewals of the accounts that
+    are actually serving traffic.  Enabled accounts with no expiry recorded are
+    always due: that is how a freshly imported account gets its first keep-alive.
+    """
+    from app import config, keepalive
+    from app.records import Account, KIND_OAUTH
+
+    class _DB:
+        async def list_accounts(self):
+            return [
+                Account(id="on", kind=KIND_OAUTH, enabled=True, email="a@x", password="p"),
+                Account(id="off", kind=KIND_OAUTH, enabled=False, email="b@x", password="p"),
+            ]
+
+    keeper = keepalive.Keeper(_DB(), None, lambda: config.default_settings("./data"))
+    summary = asyncio.run(keeper.sweep())
+    assert summary["due"] == 1  # the enabled one only
+    # `off` was not even looked at, so it is not in the skipped tally either.
+    assert summary["skipped"] == 0

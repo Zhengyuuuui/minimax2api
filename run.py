@@ -13,17 +13,40 @@ import os
 import sys
 
 
+def _env_default(name: str, fallback: str) -> str:
+    """Read a run-level setting, accepting both the bare and prefixed spelling.
+
+    ``PORT`` is what a container has always used, ``MINIMAX2API_PORT`` is what a
+    reader of the settings namespace expects; accepting both costs nothing and a
+    deployment that picked either should not have to be told it was wrong.
+    """
+    return os.environ.get("MINIMAX2API_" + name, os.environ.get(name, fallback))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="minimaxcode2api", description="MiniMax Agent 反代（无鉴权）")
-    parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "4555")))
+    parser.add_argument("--host", default=_env_default("HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(_env_default("PORT", "4555")))
     parser.add_argument(
         "--data-dir",
-        default=os.environ.get("DATA_DIR", "./data"),
+        default=_env_default("DATA_DIR", "./data"),
         help="where the SQLite store and generated media live",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=os.environ.get("ENV_FILE", ".env"),
+        help="dotenv file applied before startup (env vars win over it)",
     )
     parser.add_argument("--reload", action="store_true", help="development mode")
     args = parser.parse_args()
+
+    # The file is read here, before anything imports settings, so a container that
+    # only ships the file is a container that works.  Real variables win over it,
+    # which keeps a one-off override from having to edit the file.
+    from app import env as env_mod
+
+    for key, value in env_mod.load_dotenv(args.env_file).items():
+        os.environ.setdefault(key, value)
 
     try:
         import uvicorn

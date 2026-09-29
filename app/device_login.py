@@ -161,6 +161,57 @@ def _join(path: str, key: str) -> str:
     return f"{path}.{key}" if path else key
 
 
+def find_refresh_token(payload: Any, depth: int = 0) -> str:
+    """Locate the refresh token in a successful poll response, if one is there.
+
+    The access token is the one that answers requests, so ``find_token`` stops at
+    it; but an account imported without a refresh token can never be renewed and
+    dies when its one-hour access token expires.  The device grant mints both in
+    the same response, so the refresh token is taken here rather than left behind.
+    """
+    if depth > 4:
+        return ""
+    if isinstance(payload, dict):
+        for key in ("refresh_token", "refreshToken"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+        for value in payload.values():
+            found = find_refresh_token(value, depth + 1)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = find_refresh_token(item, depth + 1)
+            if found:
+                return found
+    return ""
+
+
+def find_expires_in(payload: Any, depth: int = 0) -> float:
+    """Read ``expires_in`` (seconds) from the poll response, if present."""
+    if depth > 4:
+        return 0.0
+    if isinstance(payload, dict):
+        for key in ("expires_in", "expiresIn"):
+            value = payload.get(key)
+            try:
+                if value is not None:
+                    return float(value)
+            except (TypeError, ValueError):
+                pass
+        for value in payload.values():
+            found = find_expires_in(value, depth + 1)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = find_expires_in(item, depth + 1)
+            if found:
+                return found
+    return 0.0
+
+
 @dataclass
 class DeviceSession:
     """One in-flight browser sign-in."""
@@ -397,7 +448,11 @@ class DeviceLoginService:
 
             try:
                 account = await self._admin.import_device_token(
-                    token, session.name, region=session.region
+                    token,
+                    session.name,
+                    region=session.region,
+                    refresh_token=find_refresh_token(payload),
+                    expires_in=find_expires_in(payload),
                 )
             except Exception as err:  # noqa: BLE001 - the reason belongs in the console
                 session.status = FAILED

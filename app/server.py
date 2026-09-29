@@ -25,8 +25,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from . import admin as admin_mod
 from . import device_login
 from . import gateway as gateway_mod
+from . import keepalive as keepalive_mod
 from . import pool as pool_mod
 from . import signin as signin_mod
+from . import signup as signup_mod
 from . import upstream
 from .db import Database
 from .media import MediaStore
@@ -64,6 +66,23 @@ class AppState:
         # Needs the admin, so it is built after it: the approved token is imported
         # as an account, and the import already knows how.
         self.device_login = device_login.DeviceLoginService(self.client, self.admin)
+        # Same shape of dependency: registration ends by minting an OAuth token and
+        # importing it, which is the admin's job.  The check-in service rides along
+        # so a new account claims its first day of credit immediately — that credit
+        # is issued by the check-in endpoint, not by registration.
+        self.signup = signup_mod.SignupService(
+            self.client, self.admin, lambda: self.db.settings(), self.db, self.signin
+        )
+        # Renews the one-hour OAuth tokens before they expire.  Built last because
+        # it is the only component that reasons about credentials already in the
+        # pool rather than about one arriving.
+        self.keepalive = keepalive_mod.Keeper(
+            self.db, self.client, lambda: self.db.settings()
+        )
+        self.admin.keepalive = self.keepalive
+        # The request path's safety net: a token can expire between two sweeps, so
+        # the pool renews on a refused credential before retiring the account.
+        self.pool.renewer = self.keepalive.renew_account
 
     async def open(self) -> None:
         await self.db.connect()
@@ -72,9 +91,11 @@ class AppState:
         # Only one background task touches accounts, so there is nothing here to
         # coordinate beyond starting it.
         self.signin.start()
+        self.keepalive.start()
 
     async def close(self) -> None:
         await self.signin.stop()
+        await self.keepalive.stop()
         await self.client.aclose()
 
 
@@ -186,9 +207,20 @@ def _register(app: FastAPI, state: AppState) -> None:
     async def list_accounts(request: Request) -> Any:
         return await state.admin.list_accounts()
 
+    @app.post("/admin/api/accounts/probe-all")
+    async def probe_all_accounts(request: Request) -> Any:
+        body = await json_body(request)
+        ids = body.get("accountIds") if isinstance(body, dict) else None
+        return await state.admin.probe_all(ids if isinstance(ids, list) else None)
+
     @app.post("/admin/api/accounts")
     async def import_accounts(request: Request) -> Any:
         return await state.admin.import_accounts(await json_body(request))
+
+    @app.post("/admin/api/accounts/password")
+    async def import_password_accounts(request: Request) -> Any:
+        """Import email+password entries, signing each in for a token."""
+        return await state.admin.import_password_accounts(await json_body(request))
 
     @app.post("/admin/api/accounts/discover")
     async def import_accounts_silent(request: Request) -> Any:
@@ -209,6 +241,10 @@ def _register(app: FastAPI, state: AppState) -> None:
     async def account_action(account_id: str, action: str, request: Request) -> Any:
         return await state.admin.account_action(account_id, action)
 
+    @app.get("/admin/api/accounts/{account_id}/password")
+    async def account_password(account_id: str) -> Any:
+        return await state.admin.account_password(account_id)
+
     @app.post("/admin/api/login-device")
     async def login_device_start(request: Request) -> Any:
         """Begin a browser sign-in.  Answers a URL to click and a code to show."""
@@ -224,6 +260,53 @@ def _register(app: FastAPI, state: AppState) -> None:
     @app.delete("/admin/api/login-device/{session_id}")
     async def login_device_cancel(session_id: str) -> Any:
         return await state.device_login.cancel(session_id)
+
+    @app.post("/admin/api/signup")
+    async def signup_start(request: Request) -> Any:
+        """Begin a headless registration.  Answers a session to poll."""
+        body = await json_body(request)
+        name = body.get("name") if isinstance(body, dict) else ""
+        region = body.get("region") if isinstance(body, dict) else ""
+        count = body.get("count") if isinstance(body, dict) else 1
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = 1
+        return await state.signup.start(str(name or ""), str(region or ""), count)
+
+    @app.get("/admin/api/signup/{session_id}")
+    async def signup_status(session_id: str) -> Any:
+        return state.signup.get(session_id)
+
+    @app.delete("/admin/api/signup/{session_id}")
+    async def signup_cancel(session_id: str) -> Any:
+        return await state.signup.cancel(session_id)
+
+    # ------------------------------------------------------------------ proxies
+
+    @app.get("/admin/api/proxies")
+    async def list_proxies(request: Request) -> Any:
+        return await state.admin.list_proxies()
+
+    @app.post("/admin/api/proxies")
+    async def add_proxies(request: Request) -> Any:
+        return await state.admin.add_proxies(await json_body(request))
+
+    @app.patch("/admin/api/proxies/{proxy_id}")
+    async def update_proxy(proxy_id: str, request: Request) -> Any:
+        return await state.admin.update_proxy(proxy_id, await json_body(request))
+
+    @app.delete("/admin/api/proxies/{proxy_id}")
+    async def delete_proxy(proxy_id: str) -> Any:
+        return await state.admin.delete_proxy(proxy_id)
+
+    @app.post("/admin/api/proxies/{proxy_id}/check")
+    async def check_proxy(proxy_id: str) -> Any:
+        return await state.admin.check_proxy(proxy_id)
+
+    @app.post("/admin/api/proxies/check-all")
+    async def check_all_proxies(request: Request) -> Any:
+        return await state.admin.check_all_proxies()
 
     @app.get("/admin/api/groups")
     async def groups(request: Request) -> Any:
@@ -280,11 +363,30 @@ def _register(app: FastAPI, state: AppState) -> None:
     async def signin_status(request: Request) -> Any:
         return await state.admin.signin_status()
 
+    @app.get("/admin/api/keepalive")
+    async def keepalive_status(request: Request) -> Any:
+        return await state.admin.keepalive_status()
+
+    @app.post("/admin/api/keepalive/sweep")
+    async def keepalive_sweep(request: Request) -> Any:
+        return await state.admin.keepalive_sweep()
+
     @app.post("/admin/api/signin/run")
     async def signin_run(request: Request) -> Any:
         body = await json_body(request)
         ids = body.get("accountIds") if isinstance(body, dict) else None
         return await state.admin.signin_run_now(ids if isinstance(ids, list) else None)
+
+    @app.get("/admin/api/credit")
+    async def credit_status(request: Request) -> Any:
+        return await state.admin.credit_status()
+
+    @app.post("/admin/api/credit/refresh")
+    async def credit_refresh(request: Request) -> Any:
+        """Refresh balances now.  Body may name ids, else every stale account."""
+        body = await json_body(request)
+        ids = body.get("accountIds") if isinstance(body, dict) else None
+        return await state.admin.credit_refresh(ids if isinstance(ids, list) else None)
 
     # ------------------------------------------------------------------- pages
 

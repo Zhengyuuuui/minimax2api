@@ -32,6 +32,15 @@ KIND_GUEST = "guest"
 # parameter.  Same upstream, two ways in; see upstream.Credential.
 KIND_OAUTH = "oauth"
 
+# How an account was imported.  ``token`` is a browser sign-in or a pasted JWT: a
+# credential only, with whatever refresh token the flow managed to capture.
+# ``password`` is an email+password entry, which can always be signed in again
+# from the console; ``signup`` is a headless registration, which produces both.
+SOURCE_TOKEN = "token"
+SOURCE_PASSWORD = "password"
+SOURCE_SIGNUP = "signup"
+SOURCE_DEVICE = "device"
+
 # Model types. Not cosmetic: the gateway dispatches on them.
 MODEL_CHAT = "chat"
 MODEL_IMAGE = "image"
@@ -178,9 +187,9 @@ class Credit:
     capacity that a single request refills.
     """
 
-    total: int = 0
-    free: int = 0
-    purchased: int = 0
+    total: float = 0.0
+    free: float = 0.0
+    purchased: float = 0.0
     plan_name: str = ""
     plan_type: int = 0
     synced_at: float = 0.0
@@ -200,9 +209,9 @@ class Credit:
         if not isinstance(node, dict):
             return None
         return cls(
-            total=int(_as_float(node.get("total"))),
-            free=int(_as_float(node.get("free"))),
-            purchased=int(_as_float(node.get("purchased"))),
+            total=_as_float(node.get("total")),
+            free=_as_float(node.get("free")),
+            purchased=_as_float(node.get("purchased")),
             plan_name=str(node.get("planName") or ""),
             plan_type=int(_as_float(node.get("planType"))),
             synced_at=_as_ts(node.get("syncedAt")),
@@ -226,6 +235,20 @@ class Account:
     # Best-effort email or phone decoded from the token, used to tell accounts
     # apart in the console.
     identifier: str = ""
+    # The address the account was registered with, and the password if one was
+    # set.  Separate from ``identifier``, which the upstream reports and which
+    # may be a username or a phone: neither is the login the operator reads off
+    # the console to sign in by hand.  The password is only ever returned masked.
+    email: str = ""
+    password: str = ""
+    # The OAuth refresh token and when the access token stops working.
+    #
+    # The access token lives one hour, so a pool without these is a pool that
+    # empties itself every hour.  The refresh token is what makes the credential
+    # renewable without a mailbox; ``token_expires_at`` lets the keeper refresh
+    # *before* a request fails, instead of discovering it from a 401.
+    refresh_token: str = ""
+    token_expires_at: float = 0.0
     # The numeric agent id.  A role name is never an id: the upstream answers
     # one with a 200 that opens no session.
     agent_id: str = ""
@@ -239,6 +262,12 @@ class Account:
     base_url: str = ""
     group: str = ""
     remark: str = ""
+    # How the account arrived.  The two are not interchangeable: a password
+    # import brought an email and a password and can be re-signed-in from the
+    # console alone, while a browser sign-in brought only a token and depends on
+    # its refresh token to survive.  The console shows which is which so an
+    # operator knows what an account can do without opening it.
+    source: str = SOURCE_TOKEN
     enabled: bool = True
     priority: int = 0
     max_concurrent: int = 1
@@ -256,7 +285,7 @@ class Account:
     signin_status: str = ""
     signin_streak: int = 0
     signin_points: int = 0
-    signin_total: int = 0
+    signin_total: float = 0.0
     signin_error: str = ""
     signin_panel: SigninPanel | None = None
     credit: Credit | None = None
@@ -272,6 +301,7 @@ class AccountView:
     region: str
     user_id: str
     identifier: str
+    email: str
     agent_id: str
     device_id: str
     uuid: str
@@ -280,6 +310,7 @@ class AccountView:
     base_url: str
     group: str
     remark: str
+    source: str
     enabled: bool
     priority: int
     max_concurrent: int
@@ -293,12 +324,17 @@ class AccountView:
     updated_at: str
     quota: dict[str, Any] | None
     token_masked: str
+    password_masked: str
+    # Whether renewal is possible and when the current token dies; the refresh
+    # token itself is never projected, only the fact that one exists.
+    renewable: bool
+    token_expires_at: str
     inflight: int
     signin_at: str
     signin_status: str
     signin_streak: int
     signin_points: int
-    signin_total: int
+    signin_total: float
     signin_error: str
     signin_panel: dict[str, Any] | None
     credit: dict[str, Any] | None
@@ -311,6 +347,7 @@ class AccountView:
             "region": self.region,
             "userId": self.user_id,
             "identifier": self.identifier,
+            "email": self.email,
             "agentID": self.agent_id,
             "deviceID": self.device_id,
             "uuid": self.uuid,
@@ -319,6 +356,7 @@ class AccountView:
             "baseURL": self.base_url,
             "group": self.group,
             "remark": self.remark,
+            "source": self.source,
             "enabled": self.enabled,
             "priority": self.priority,
             "maxConcurrent": self.max_concurrent,
@@ -332,6 +370,9 @@ class AccountView:
             "updatedAt": self.updated_at,
             "quota": self.quota,
             "tokenMasked": self.token_masked,
+            "passwordMasked": self.password_masked,
+            "renewable": self.renewable,
+            "tokenExpiresAt": self.token_expires_at,
             "inflight": self.inflight,
             "signinAt": self.signin_at,
             "signinStatus": self.signin_status,
@@ -408,6 +449,85 @@ class MediaItem:
             "accountName": self.account_name,
             "createdAt": iso(self.created_at),
         }
+
+
+# Proxy status values.  ``unknown`` is the state an entry is added in: it has not
+# been dialled yet, and "not tried" is not "dead".
+PROXY_UNKNOWN = "unknown"
+PROXY_OK = "ok"
+PROXY_BAD = "bad"
+
+# How a proxy is chosen for the next registration.  ``rotate`` walks the list in
+# order so successive accounts leave by different addresses; ``random`` picks one;
+# ``single`` pins the first usable entry (useful when only one is trustworthy).
+PROXY_STRATEGIES = ("rotate", "random", "single")
+
+
+@dataclass
+class Proxy:
+    """One outbound proxy, and the last thing known about it.
+
+    ``exit_ip`` is the point of the record: the risk control that matters is
+    per-address, so a proxy without a resolved exit address cannot be counted
+    against a limit.  It is filled by ``proxy.check`` rather than at add time,
+    because adding a URL is a paste and dialling it is a network call.
+    """
+
+    id: str = ""
+    url: str = ""
+    scheme: str = ""
+    enabled: bool = True
+    # Last check result.
+    status: str = PROXY_UNKNOWN
+    exit_ip: str = ""
+    country: str = ""
+    city: str = ""
+    isp: str = ""
+    latency_ms: int = 0
+    checked_at: float = 0.0
+    # A proxy that keeps failing is retired without being deleted, so its record
+    # of which addresses it once served survives.
+    fail_count: int = 0
+    # How many accounts were registered through it.
+    used_count: int = 0
+    last_used_at: float = 0.0
+    created_at: float = 0.0
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "url": self.url,
+            "scheme": self.scheme,
+            "enabled": self.enabled,
+            "status": self.status,
+            "exitIp": self.exit_ip,
+            "country": self.country,
+            "city": self.city,
+            "isp": self.isp,
+            "latencyMs": self.latency_ms,
+            "checkedAt": iso(self.checked_at),
+            "failCount": self.fail_count,
+            "usedCount": self.used_count,
+            "lastUsedAt": iso(self.last_used_at),
+            "createdAt": iso(self.created_at),
+        }
+
+
+@dataclass
+class IpUsage:
+    """How many accounts were registered from one exit address.
+
+    The address is the unit risk control counts in, and it is shared by every
+    proxy that egresses through it — which is why this is its own table and not a
+    column on ``Proxy``: two entries in the pool can and do resolve to one IP.
+    """
+
+    ip: str = ""
+    count: int = 0
+    last_at: float = 0.0
+
+    def to_json(self) -> dict[str, Any]:
+        return {"ip": self.ip, "count": self.count, "lastAt": iso(self.last_at)}
 
 
 @dataclass
@@ -569,6 +689,16 @@ def mask_token(token: str) -> str:
     if len(token) <= 12:
         return token[:4] + "***"
     return token[:10] + "…" + token[-6:]
+
+
+def mask_password(password: str) -> str:
+    """Report that a password exists without revealing its length or content.
+
+    Unlike a token there is nothing here worth recognising — a password has no
+    structure and no issuer — so the mask is a fixed run of dots rather than a
+    prefix/suffix view.
+    """
+    return "•" * 8 if password else ""
 
 
 def _as_ts(value: Any) -> float:

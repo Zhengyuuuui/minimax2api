@@ -20,14 +20,21 @@ column added later cannot be silently dropped by a route that predates it.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable
 
 from . import upstream
+from . import proxy as proxy_mod
 from .records import (
     STATUS_ACTIVE,
     STATUS_INVALID,
+    SOURCE_DEVICE,
+    SOURCE_PASSWORD,
+    SOURCE_SIGNUP,
+    SOURCE_TOKEN,
     Account,
     KIND_GUEST,
     KIND_OAUTH,
@@ -89,6 +96,11 @@ class AccountInput:
     group: str = ""
     remark: str = ""
     identifier: str = ""
+    email: str = ""
+    password: str = ""
+    refresh_token: str = ""
+    token_expires_at: float = 0.0
+    source: str = SOURCE_TOKEN
     kind: str = KIND_TOKEN
 
     @classmethod
@@ -146,6 +158,10 @@ class AccountInput:
             token=self.token,
             user_id=self.user_id,
             identifier=self.identifier,
+            email=self.email,
+            password=self.password,
+            refresh_token=self.refresh_token,
+            token_expires_at=self.token_expires_at,
             agent_id=self.agent_id,
             device_id=self.device_id or random_device_id(),
             uuid=self.uuid or random_uuid(),
@@ -154,6 +170,7 @@ class AccountInput:
             base_url=self.base_url,
             group=self.group,
             remark=self.remark,
+            source=self.source,
             enabled=True,
             priority=0,
             max_concurrent=1,
@@ -182,6 +199,68 @@ def _as_bool(value: Any, current: bool) -> bool:
     return current
 
 
+def _urls_from(payload: Any) -> list[str]:
+    """Read proxy URLs from a string, a list, or an object with ``url``/``urls``.
+
+    All three arrive: the console sends ``{url}`` for one and ``{urls:[...]}`` for
+    a paste, and a script may POST a bare string.  Blank lines are dropped so a
+    trailing newline in a pasted block is not an error.
+    """
+    raw: Any = payload
+    if isinstance(payload, dict):
+        raw = payload.get("urls", payload.get("url", ""))
+    if isinstance(raw, str):
+        items = raw.replace("\r", "\n").split("\n")
+    elif isinstance(raw, list):
+        items = [str(item) for item in raw]
+    else:
+        items = []
+    out: list[str] = []
+    for item in items:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _password_lines(payload: Any) -> list[tuple[str, str]]:
+    """Read ``email password`` pairs from a pasted block.
+
+    One pair per line, split on the first ``----``, tab, comma or run of spaces,
+    so both ``a@b.com secret`` and ``a@b.com----secret`` work.  The password is
+    taken whole after the first separator: it may contain spaces, and truncating
+    it on the next one would silently store the wrong password.
+    """
+    raw: Any = payload
+    if isinstance(payload, dict):
+        raw = payload.get("accounts", payload.get("lines", payload.get("text", "")))
+    if isinstance(raw, list):
+        items = [str(item) for item in raw]
+    elif isinstance(raw, str):
+        items = raw.replace("\r", "\n").split("\n")
+    else:
+        items = []
+
+    out: list[tuple[str, str]] = []
+    for line in items:
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        email, _, password = text.partition("----")
+        if not _:
+            for sep in ("\t", ","):
+                if sep in text:
+                    email, _, password = text.partition(sep)
+                    break
+            else:
+                email, _, password = text.partition(" ")
+        email = email.strip()
+        password = password.strip()
+        if email and password:
+            out.append((email, password))
+    return out
+
+
 # ---------------------------------------------------------------------- service
 
 
@@ -195,6 +274,10 @@ class AdminService:
     media: Any
     signin: Any
     settings_fn: Any
+    # Set by server.py after construction: the keeper needs the admin (for token
+    # import) and the admin needs the keeper (for renewal), and one of the two
+    # references has to be late-bound to avoid a cycle.
+    keepalive: Any = None
 
     # ----------------------------------------------------------------- accounts
 
@@ -208,6 +291,18 @@ class AdminService:
         if account is None:
             raise AdminError(404, "account not found")
         return account_view(account, 0).to_json()
+
+    async def account_password(self, account_id: str) -> dict[str, Any]:
+        """Return an account's stored password, for the console's reveal action.
+
+        Deliberately a separate call rather than a field on the account list: the
+        list is fetched on every render and by anyone who can reach the port, and
+        the password is only needed when an operator asks to see it.
+        """
+        account = await self.db.account_by_id(account_id)
+        if account is None:
+            raise AdminError(404, "account not found")
+        return {"id": account.id, "password": account.password or ""}
 
     async def import_accounts(self, payload: Any, *, discover: bool = True) -> dict[str, Any]:
         """Add accounts, discovering whatever cannot be pasted in.
@@ -226,6 +321,77 @@ class AdminService:
         results = [await self._import_one(AccountInput.from_payload(node), discover) for node in nodes]
         await self.pool.load()
         return {"results": [item.to_json() for item in results], "imported": sum(1 for r in results if r.ok)}
+
+    async def import_password_accounts(self, payload: Any) -> dict[str, Any]:
+        """Import accounts from email+password pairs, signing each one in.
+
+        A password entry has no token to paste, so the token is minted by logging
+        in — the same password grant the keeper's fallback uses.  One entry that
+        cannot sign in is reported on its own and does not stop the rest, exactly
+        like a token batch.  A successful sign-in stores the access token, the
+        refresh token *and* the password, so this account is the kind that can
+        always be recovered from the console alone.
+        """
+        lines = _password_lines(payload)
+        if not lines:
+            raise AdminError(400, "no email/password entries given")
+
+        settings = self.settings_fn()
+        proxy = (settings.upstream.proxy or "").strip() or None
+        results = []
+        for email, password in lines:
+            name = email.split("@")[0]
+            try:
+                import httpx
+
+                from . import keepalive
+                from .security import random_device_id, random_uuid
+
+                account = type("A", (), {})()
+                account.email = email
+                account.password = password
+                account.region = REGION_GLOBAL
+                account.uuid = random_uuid()
+                account.device_id = random_device_id()
+                async with httpx.AsyncClient(
+                    timeout=30.0, follow_redirects=False, trust_env=False, proxy=proxy
+                ) as client:
+                    renewed = await keepalive.renew_with_password(
+                        client, account, settings.signup
+                    )
+                if not renewed.ok:
+                    results.append({"email": email, "ok": False, "reason": renewed.error})
+                    continue
+
+                item = AccountInput(
+                    token=renewed.token,
+                    name=name,
+                    region=REGION_GLOBAL,
+                    kind=KIND_OAUTH,
+                    email=email,
+                    password=password,
+                    refresh_token=renewed.refresh_token,
+                    token_expires_at=renewed.expires_at,
+                    source=SOURCE_PASSWORD,
+                )
+                imported = await self._import_one(item, discover=True)
+                results.append(
+                    {
+                        "email": email,
+                        "ok": imported.ok,
+                        "reason": imported.reason,
+                        "id": imported.id,
+                    }
+                )
+            except Exception as err:  # noqa: BLE001 - one entry cannot kill the batch
+                results.append({"email": email, "ok": False, "reason": _short(err)})
+
+        await self.pool.load()
+        return {
+            "results": results,
+            "imported": sum(1 for item in results if item["ok"]),
+            "total": len(results),
+        }
 
     async def _import_one(self, item: AccountInput | None, discover: bool) -> ImportResult:
         if item is None:
@@ -263,7 +429,16 @@ class AdminService:
         return ImportResult(ok=True, id=stored.id, name=stored.name or stored.id)
 
     async def import_device_token(
-        self, token: str, name: str = "", region: str = REGION_GLOBAL
+        self,
+        token: str,
+        name: str = "",
+        region: str = REGION_GLOBAL,
+        email: str = "",
+        password: str = "",
+        remark: str = "",
+        refresh_token: str = "",
+        expires_in: float = 0.0,
+        source: str = SOURCE_DEVICE,
     ) -> dict[str, Any]:
         """Turn a freshly signed-in access token into a pool account.
 
@@ -275,10 +450,28 @@ class AdminService:
         ``region`` is the region whose account service issued the token, and it
         has to be stored with the account: the two deployments have separate
         account databases, so a token is accepted by exactly one of them.
+
+        ``email``/``password`` are recorded when the caller knows them — the
+        headless signup path does, the browser sign-in does not — because they
+        are the login an operator reads off the console, and the upstream's
+        ``identifier`` is a username or phone rather than either.
         """
         if region not in (REGION_CN, REGION_GLOBAL):
             region = REGION_GLOBAL
-        item = AccountInput(token=token.strip(), name=name.strip(), region=region, kind=KIND_OAUTH)
+        item = AccountInput(
+            token=token.strip(),
+            name=name.strip(),
+            region=region,
+            kind=KIND_OAUTH,
+            email=email.strip(),
+            password=password,
+            remark=remark,
+            refresh_token=refresh_token.strip(),
+            # The device-flow response carries expires_in; recording it lets the
+            # keeper renew this account before it dies instead of only after a 401.
+            token_expires_at=(time.time() + float(expires_in)) if expires_in else 0.0,
+            source=source,
+        )
         if not item.token:
             raise AdminError(502, "the sign-in returned no token")
         result = await self._import_one(item, discover=True)
@@ -356,7 +549,7 @@ class AdminService:
         An unknown action is refused rather than ignored: a silently dropped
         action reads to the operator as one that worked.
         """
-        if action not in ("enable", "disable", "reset", "probe", "credit", "signin"):
+        if action not in ("enable", "disable", "reset", "probe", "credit", "signin", "renew"):
             raise AdminError(400, f"unknown action {action!r}")
         account = await self.db.account_by_id(account_id)
         if account is None:
@@ -366,12 +559,18 @@ class AdminService:
             return await self.probe_account(account_id)
         if action == "credit":
             return await self.credit_account(account_id)
+        if action == "renew":
+            return await self.keepalive_renew(account_id)
         if action == "signin":
             if self.signin is None:
                 raise AdminError(400, "check-in is not available")
-            run = await self.signin.run_now([account_id])
-            outcomes = run.get("outcomes") or [{}]
-            return outcomes[0]
+            # Run this one account directly rather than through a full pass: a
+            # disabled account is skipped by the daily run, but the operator
+            # pressing the button means this account, now.  The claim endpoint is
+            # idempotent, so pressing it again on a day already claimed answers
+            # `already` instead of double-crediting.
+            outcome = await self.signin.run_account(account)
+            return outcome.to_json()
 
         def apply(item: Account) -> None:
             if action == "enable":
@@ -431,6 +630,106 @@ class AdminService:
             await self.pool.note_saved(saved)
         return {"ok": True, "latencyMs": latency, "accountId": account_id}
 
+    async def probe_all(self, account_ids: list[str] | None = None) -> dict[str, Any]:
+        """Probe accounts one after another and report each result.
+
+        Sequential rather than concurrent: every probe opens a session against the
+        same upstream, and a burst of them from one address is the pattern the
+        routing settings already pace check-in to avoid.  One account failing does
+        not stop the rest — a pool is inspected precisely when something is wrong,
+        and the working accounts are the ones that prove it is one account.
+        """
+        if account_ids:
+            wanted = set(account_ids)
+            accounts = [a for a in await self.db.list_accounts() if a.id in wanted]
+        else:
+            accounts = await self.db.list_accounts()
+
+        results = []
+        for account in accounts:
+            try:
+                result = await self.probe_account(account.id)
+            except AdminError as err:
+                result = {"ok": False, "error": err.message}
+            except Exception as err:  # noqa: BLE001 - one account cannot kill the pass
+                result = {"ok": False, "error": _short(err)}
+            results.append(
+                {
+                    "accountId": account.id,
+                    "accountName": account.name or account.id,
+                    **result,
+                }
+            )
+            await asyncio.sleep(1.0)
+
+        return {
+            "ok": all(item.get("ok") for item in results) if results else True,
+            "total": len(results),
+            "okCount": sum(1 for item in results if item.get("ok")),
+            "results": results,
+        }
+
+    async def probe_credit(self, account_id: str) -> dict[str, Any]:
+        """Read the balance from every source that reports one, without writing.
+
+        A balance is reported by more than one endpoint and they do not always
+        agree: the membership endpoint carries an `op_credit_summary` for migrated
+        accounts and a flat `total_remains_credit` for the ones that predate it,
+        while the credit-details endpoint lists grants.  A zero from the flat field
+        on a migrated account is not an empty balance, it is the wrong field.
+
+        Nothing is persisted: this is what to run when the console's number and the
+        website's number disagree, and a probe that repaired state would hide the
+        disagreement it exists to expose.
+        """
+        account = await self.db.account_by_id(account_id)
+        if account is None:
+            raise AdminError(404, "account not found")
+        credential = upstream.credential_of(account)
+        sources: dict[str, Any] = {}
+        chosen: dict[str, Any] | None = None
+
+        # The endpoint the bridge actually uses, through the normal parser.
+        try:
+            info = await self.client.credit(credential)
+            sources["membership"] = {
+                "ok": True,
+                "total": info.total,
+                "free": info.free,
+                "purchased": info.purchased,
+                "planName": info.plan_name,
+                "planType": info.plan_type,
+            }
+            chosen = sources["membership"]
+        except Exception as err:  # noqa: BLE001 - the failure is a reading too
+            sources["membership"] = {"ok": False, "error": _short(err)}
+
+        # The raw envelopes, so a field the parser does not read is still visible.
+        for name, method, path, body in (
+            ("membershipRaw", "POST", "/matrix/api/v1/commerce/get_membership_info", "{}"),
+            ("grants", "GET", "/minimax-cloud/api/v1/credit/details", ""),
+        ):
+            try:
+                raw = await self.client.fetch_raw(credential, method, path, body)
+                payload = json.loads(raw.body) if raw.body.strip().startswith("{") else None
+                sources[name] = {
+                    "ok": raw.status == 200,
+                    "status": raw.status,
+                    "fields": _credit_fields(payload) if payload else raw.body[:400],
+                }
+            except Exception as err:  # noqa: BLE001
+                sources[name] = {"ok": False, "error": _short(err)}
+
+        return {
+            "ok": bool(chosen and chosen.get("ok")),
+            "accountId": account_id,
+            "accountName": account.name or account_id,
+            "kind": account.kind,
+            "stored": account.credit.to_json() if account.credit else None,
+            "live": chosen,
+            "sources": sources,
+        }
+
     async def credit_account(self, account_id: str) -> dict[str, Any]:
         """Read and store the live balance.
 
@@ -465,6 +764,85 @@ class AdminService:
 
     async def groups(self) -> dict[str, list[str]]:
         return {"groups": await self.db.account_groups()}
+
+    # ------------------------------------------------------------------ proxies
+
+    async def list_proxies(self) -> dict[str, Any]:
+        proxies = await self.db.list_proxies()
+        return {
+            "proxies": [proxy.to_json() for proxy in proxies],
+            "ipUsage": [usage.to_json() for usage in await self.db.list_ip_usage()],
+        }
+
+    async def add_proxies(self, payload: Any) -> dict[str, Any]:
+        """Add one pasted proxy or a newline-separated batch of them.
+
+        Every entry is reported individually: a batch of twenty is normal, and
+        one malformed line should not refuse the other nineteen.
+        """
+        urls = _urls_from(payload)
+        if not urls:
+            raise AdminError(400, "no proxy URLs given")
+        results = []
+        for url in urls:
+            if not proxy_mod.is_valid(url):
+                results.append({"url": proxy_mod.redact(url), "ok": False,
+                                "reason": "need socks5://, socks5h://, http:// or https:// with a host"})
+                continue
+            entry = await self.db.add_proxy(proxy_mod.make_proxy(url))
+            results.append({"url": proxy_mod.redact(entry.url), "ok": True, "id": entry.id})
+        return {"results": results, "added": sum(1 for r in results if r["ok"])}
+
+    async def update_proxy(self, proxy_id: str, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise AdminError(400, "expected a JSON object")
+
+        def apply(entry: Any) -> None:
+            if "enabled" in payload:
+                entry.enabled = _as_bool(payload["enabled"], entry.enabled)
+
+        entry = await self.db.update_proxy(proxy_id, apply)
+        if entry is None:
+            raise AdminError(404, "proxy not found")
+        return entry.to_json()
+
+    async def delete_proxy(self, proxy_id: str) -> dict[str, int]:
+        return {"deleted": await self.db.delete_proxy(proxy_id)}
+
+    async def check_proxy(self, proxy_id: str) -> dict[str, Any]:
+        """Dial one proxy and store what it resolves to."""
+        entry = await self.db.proxy_by_id(proxy_id)
+        if entry is None:
+            raise AdminError(404, "proxy not found")
+        settings = self.settings_fn()
+        result = await proxy_mod.check(entry.url, geo_url=settings.signup.proxy_check_url)
+
+        def apply(item: Any) -> None:
+            proxy_mod.apply_result(item, result)
+
+        saved = await self.db.update_proxy(proxy_id, apply)
+        return {"proxy": saved.to_json() if saved else None, **result.to_json()}
+
+    async def check_all_proxies(self) -> dict[str, Any]:
+        """Check every enabled proxy, sequentially.
+
+        Sequential on purpose: a batch of checks is the same burst-of-egress
+        pattern that gets an address noticed, and these are slow calls that would
+        otherwise compete for the same sockets.
+        """
+        settings = self.settings_fn()
+        checked = []
+        for entry in await self.db.list_proxies():
+            if not entry.enabled:
+                continue
+            result = await proxy_mod.check(entry.url, geo_url=settings.signup.proxy_check_url)
+
+            def apply(item: Any, _r: Any = result) -> None:
+                proxy_mod.apply_result(item, _r)
+
+            saved = await self.db.update_proxy(entry.id, apply)
+            checked.append({"url": proxy_mod.redact(entry.url), **result.to_json()})
+        return {"checked": checked, "ok": sum(1 for c in checked if c["ok"])}
 
     # ------------------------------------------------------------------- models
 
@@ -531,14 +909,42 @@ class AdminService:
 
     async def get_settings(self) -> dict[str, Any]:
         from . import config as config_mod
+        from . import env as env_mod
 
-        return config_mod.to_dict(self.settings_fn())
+        # Secrets are masked and env-controlled fields are flagged, both here:
+        # this is the only surface that returns settings, and doing it at the
+        # source means no future caller can forget.
+        return config_mod.to_dict_masked(self.settings_fn(), env_mod.locked_fields())
 
     async def update_settings(self, payload: Any) -> dict[str, Any]:
         from . import config as config_mod
+        from . import env as env_mod
 
         settings = await self.db.update_settings(payload if isinstance(payload, dict) else {})
-        return config_mod.to_dict(settings)
+        return config_mod.to_dict_masked(settings, env_mod.locked_fields())
+
+    # ---------------------------------------------------------------- keepalive
+
+    async def keepalive_status(self) -> dict[str, Any]:
+        if self.keepalive is None:
+            return {"running": False, "intervalSec": 0, "lastRun": {}}
+        return self.keepalive.status()
+
+    async def keepalive_renew(self, account_id: str) -> dict[str, Any]:
+        """Renew one account's token now, on demand."""
+        if self.keepalive is None:
+            raise AdminError(400, "keep-alive is not available")
+        result = await self.keepalive.renew_account(account_id)
+        await self.pool.load()
+        return result.to_json()
+
+    async def keepalive_sweep(self) -> dict[str, Any]:
+        """Renew every account that is due, now."""
+        if self.keepalive is None:
+            raise AdminError(400, "keep-alive is not available")
+        summary = await self.keepalive.sweep()
+        await self.pool.load()
+        return summary
 
     # ------------------------------------------------------------------- signin
 
@@ -551,6 +957,65 @@ class AdminService:
         if self.signin is None:
             raise AdminError(400, "check-in is not enabled")
         return await self.signin.run_now(account_ids)
+
+    # ------------------------------------------------------------ balance refresh
+
+    async def credit_status(self) -> dict[str, Any]:
+        if self.signin is None:
+            return {"intervalMin": 0, "lastRun": None}
+        return self.signin.credit_status()
+
+    async def credit_refresh(self, account_ids: list[str] | None = None) -> dict[str, Any]:
+        """Read balances now: every stale account, or exactly the named ones.
+
+        This is the console's "refresh" — a named account is always read, so a
+        click answers with a live number rather than whatever the last pass
+        stored.
+        """
+        if self.signin is None:
+            raise AdminError(400, "balance refresh is not available")
+        return await self.signin.refresh_credits(account_ids)
+
+
+def _credit_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """The balance-bearing fields of a raw credit envelope.
+
+    Deliberately a shallow, named subset: the point of the probe is to compare
+    numbers across endpoints, not to obscure them inside a full dump, and a
+    balance endpoint's envelope carries no credential.
+    """
+    fields: dict[str, Any] = {}
+    summary = payload.get("op_credit_summary")
+    if isinstance(summary, dict):
+        fields["op_credit_summary"] = summary
+    for key in ("total_remains_credit", "opcredit_balance", "op_credit_balance",
+                "is_migrated_to_op", "plan_name", "plan_type", "has_token_plan"):
+        if key in payload:
+            fields[key] = payload[key]
+    base = payload.get("base_resp")
+    if isinstance(base, dict):
+        fields["base_resp"] = base
+    grants = payload.get("details")
+    if isinstance(grants, list):
+        fields["grants"] = [
+            {
+                "remaining": item.get("remaining_amount"),
+                "granted": item.get("granted_amount"),
+                "expireAt": item.get("expire_at_ms"),
+            }
+            for item in grants[:10]
+            if isinstance(item, dict)
+        ]
+        total = 0.0
+        for item in grants:
+            if not isinstance(item, dict):
+                continue
+            try:
+                total += float(item.get("remaining_amount") or 0)
+            except (TypeError, ValueError):
+                continue
+        fields["grantsTotal"] = round(total, 3)
+    return fields
 
 
 def _short(err: BaseException) -> str:

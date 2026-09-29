@@ -14,9 +14,11 @@ import asyncio
 import os
 import sqlite3
 import threading
+import time
 from typing import Any, Callable, TypeVar
 
 from . import config as config_mod
+from . import env as env_mod
 from . import records
 from .records import (
     HTTP_BODY_LIMIT,
@@ -24,14 +26,17 @@ from .records import (
     AccountView,
     Audit,
     Credit,
+    IpUsage,
     MediaItem,
     ModelConfig,
+    Proxy,
     Quota,
     SigninPanel,
     dumps,
     iso,
     loads_or_none,
     mask_token,
+    mask_password,
     merge_builtin_models,
 )
 
@@ -58,6 +63,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     token          TEXT NOT NULL DEFAULT '',
     user_id        TEXT NOT NULL DEFAULT '',
     identifier     TEXT NOT NULL DEFAULT '',
+    email          TEXT NOT NULL DEFAULT '',
+    password       TEXT NOT NULL DEFAULT '',
+    refresh_token  TEXT NOT NULL DEFAULT '',
+    token_expires_at REAL NOT NULL DEFAULT 0,
     agent_id       TEXT NOT NULL DEFAULT '',
     device_id      TEXT NOT NULL DEFAULT '',
     uuid           TEXT NOT NULL DEFAULT '',
@@ -66,6 +75,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     base_url       TEXT NOT NULL DEFAULT '',
     grp            TEXT NOT NULL DEFAULT '',
     remark         TEXT NOT NULL DEFAULT '',
+    source         TEXT NOT NULL DEFAULT 'token',
     enabled        INTEGER NOT NULL DEFAULT 1,
     priority       INTEGER NOT NULL DEFAULT 0,
     max_concurrent INTEGER NOT NULL DEFAULT 1,
@@ -134,16 +144,71 @@ CREATE TABLE IF NOT EXISTS media (
     created_at   REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at);
+
+CREATE TABLE IF NOT EXISTS proxies (
+    id           TEXT PRIMARY KEY,
+    url          TEXT NOT NULL UNIQUE,
+    scheme       TEXT NOT NULL DEFAULT '',
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    status       TEXT NOT NULL DEFAULT 'unknown',
+    exit_ip      TEXT NOT NULL DEFAULT '',
+    country      TEXT NOT NULL DEFAULT '',
+    city         TEXT NOT NULL DEFAULT '',
+    isp          TEXT NOT NULL DEFAULT '',
+    latency_ms   INTEGER NOT NULL DEFAULT 0,
+    checked_at   REAL NOT NULL DEFAULT 0,
+    fail_count   INTEGER NOT NULL DEFAULT 0,
+    used_count   INTEGER NOT NULL DEFAULT 0,
+    last_used_at REAL NOT NULL DEFAULT 0,
+    created_at   REAL NOT NULL DEFAULT 0
+);
+
+-- One row per exit address: risk control is per-address, and a single IP can be
+-- reached through more than one proxy entry, so this is keyed by the address.
+CREATE TABLE IF NOT EXISTS ip_usage (
+    ip      TEXT PRIMARY KEY,
+    count   INTEGER NOT NULL DEFAULT 0,
+    last_at REAL NOT NULL DEFAULT 0
+);
 """
 
 # grp is a reserved word in SQLite, so the column is quoted on every access.
 _ACCOUNT_COLUMNS = """
-    id, name, kind, region, token, user_id, identifier, agent_id, device_id,
-    uuid, screen_width, screen_height, base_url, "grp", remark, enabled, priority,
+    id, name, kind, region, token, user_id, identifier, email, password, refresh_token,
+    token_expires_at, agent_id, device_id,
+    uuid, screen_width, screen_height, base_url, "grp", remark, source, enabled, priority,
     max_concurrent, status, cooldown_until, fail_count, success_count, last_used_at,
     last_error, created_at, updated_at, signin_at, signin_status, signin_streak,
     signin_points, signin_total, signin_error, signin_panel, credit, quota
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a database was first created.
+
+    ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already exists, so
+    a column added to ``SCHEMA`` reaches a fresh install and never reaches an
+    existing one.  Each entry is idempotent and additive: a missing column is
+    appended with its default, an existing one is left alone, and no data is
+    rewritten.
+    """
+    additions = {
+        "accounts": [
+            ("email", "TEXT NOT NULL DEFAULT ''"),
+            ("password", "TEXT NOT NULL DEFAULT ''"),
+            ("refresh_token", "TEXT NOT NULL DEFAULT ''"),
+            ("token_expires_at", "REAL NOT NULL DEFAULT 0"),
+            ("source", "TEXT NOT NULL DEFAULT 'token'"),
+        ],
+    }
+    for table, columns in additions.items():
+        # Positional: callers differ on row_factory, and PRAGMA's name column is
+        # index 1 in every sqlite build.
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+    conn.commit()
 
 
 def account_from_row(row: sqlite3.Row) -> Account:
@@ -155,12 +220,17 @@ def account_from_row(row: sqlite3.Row) -> Account:
         token=row["token"],
         user_id=row["user_id"],
         identifier=row["identifier"],
+        email=row["email"],
+        password=row["password"],
+        refresh_token=row["refresh_token"],
+        token_expires_at=row["token_expires_at"],
         agent_id=row["agent_id"],
         device_id=row["device_id"],
         uuid=row["uuid"],
         base_url=row["base_url"],
         group=row["grp"],
         remark=row["remark"],
+        source=row["source"],
         enabled=bool(row["enabled"]),
         priority=row["priority"],
         max_concurrent=row["max_concurrent"],
@@ -199,6 +269,7 @@ def account_view(account: Account, inflight: int = 0) -> AccountView:
         region=account.region,
         user_id=account.user_id,
         identifier=account.identifier,
+        email=account.email,
         agent_id=account.agent_id,
         device_id=account.device_id,
         uuid=account.uuid,
@@ -207,6 +278,7 @@ def account_view(account: Account, inflight: int = 0) -> AccountView:
         base_url=account.base_url,
         group=account.group,
         remark=account.remark,
+        source=account.source,
         enabled=account.enabled,
         priority=account.priority,
         max_concurrent=account.max_concurrent,
@@ -220,6 +292,9 @@ def account_view(account: Account, inflight: int = 0) -> AccountView:
         updated_at=iso(account.updated_at),
         quota=account.quota.to_json() if account.quota else None,
         token_masked=mask_token(account.token),
+        password_masked=mask_password(account.password),
+        renewable=bool(account.refresh_token) or bool(account.email and account.password),
+        token_expires_at=iso(account.token_expires_at),
         inflight=inflight,
         signin_at=iso(account.signin_at),
         signin_status=account.signin_status,
@@ -268,6 +343,7 @@ class Database:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=30000")
         conn.executescript(SCHEMA)
+        _migrate(conn)
         self._conn = conn
 
         row = conn.execute("SELECT json FROM settings WHERE id = 1").fetchone()
@@ -281,6 +357,15 @@ class Database:
                 "INSERT INTO settings (id, json) VALUES (1, ?) "
                 "ON CONFLICT(id) DO UPDATE SET json = excluded.json",
                 (config_mod.to_json(settings),),
+            )
+        # The environment is applied *after* the stored document, so it always
+        # wins: a value supplied by the deployment is not something a row can
+        # disagree with.  See env.py for why.
+        applied = env_mod.apply_env(settings)
+        if applied:
+            print(
+                "[config] environment overrides: " + ", ".join(sorted(applied)),
+                flush=True,
             )
         self._settings = settings
 
@@ -319,6 +404,10 @@ class Database:
             settings = config_mod.parse_json(self._raw_settings(conn), self.data_dir)
             config_mod.apply_update(settings, payload)
             config_mod.normalize(settings, self.data_dir)
+            # Re-apply the environment over the freshly edited document: a
+            # console edit to an env-controlled field is stored but cannot win,
+            # which is what keeps the two from silently disagreeing.
+            env_mod.apply_env(settings)
             self._raw_settings(conn, config_mod.to_json(settings))
             conn.commit()
             return settings
@@ -368,18 +457,23 @@ class Database:
             account.updated_at = now
             conn.execute(
                 'INSERT INTO accounts (id, name, kind, region, token, user_id, identifier,'
-                " agent_id, device_id, uuid, screen_width, screen_height, base_url, \"grp\", remark,"
+                " email, password, refresh_token, token_expires_at,"
+                " agent_id, device_id, uuid, screen_width, screen_height, base_url,"
+                " \"grp\", remark, source,"
                 " enabled, priority, max_concurrent, status, cooldown_until, fail_count, success_count,"
                 " last_used_at, last_error, created_at, updated_at, signin_at, signin_status,"
                 " signin_streak, signin_points, signin_total, signin_error, signin_panel, credit, quota)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                " ?, ?, ?, ?, ?, ?, ?, ?)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(id) DO UPDATE SET"
                 " name = excluded.name, kind = excluded.kind, region = excluded.region,"
                 " token = excluded.token, user_id = excluded.user_id, identifier = excluded.identifier,"
+                " email = excluded.email, password = excluded.password,"
+                " refresh_token = excluded.refresh_token, token_expires_at = excluded.token_expires_at,"
                 " agent_id = excluded.agent_id, device_id = excluded.device_id, uuid = excluded.uuid,"
                 " screen_width = excluded.screen_width, screen_height = excluded.screen_height,"
                 ' base_url = excluded.base_url, "grp" = excluded."grp", remark = excluded.remark,'
+                " source = excluded.source,"
                 " enabled = excluded.enabled, priority = excluded.priority,"
                 " max_concurrent = excluded.max_concurrent, status = excluded.status,"
                 " cooldown_until = excluded.cooldown_until, updated_at = excluded.updated_at",
@@ -402,8 +496,10 @@ class Database:
             account.updated_at = records.now_ts()
             conn.execute(
                 'UPDATE accounts SET name = ?, kind = ?, region = ?, token = ?, user_id = ?,'
-                " identifier = ?, agent_id = ?, device_id = ?, uuid = ?, screen_width = ?,"
-                " screen_height = ?, base_url = ?, \"grp\" = ?, remark = ?, enabled = ?, priority = ?,"
+                " identifier = ?, email = ?, password = ?, refresh_token = ?, token_expires_at = ?,"
+                " agent_id = ?, device_id = ?, uuid = ?,"
+                " screen_width = ?,"
+                " screen_height = ?, base_url = ?, \"grp\" = ?, remark = ?, source = ?, enabled = ?, priority = ?,"
                 " max_concurrent = ?, status = ?, cooldown_until = ?, fail_count = ?, success_count = ?,"
                 " last_used_at = ?, last_error = ?, updated_at = ?, signin_at = ?, signin_status = ?,"
                 " signin_streak = ?, signin_points = ?, signin_total = ?, signin_error = ?,"
@@ -717,6 +813,144 @@ class Database:
 
         return await self.run(apply)
 
+    # ------------------------------------------------------------------ proxies
+
+    async def list_proxies(self) -> list[Proxy]:
+        def read(conn: sqlite3.Connection) -> list[Proxy]:
+            rows = conn.execute("SELECT * FROM proxies ORDER BY created_at, id").fetchall()
+            return [proxy_from_row(row) for row in rows]
+
+        return await self.run(read)
+
+    async def proxy_by_id(self, proxy_id: str) -> Proxy | None:
+        def read(conn: sqlite3.Connection) -> Proxy | None:
+            row = conn.execute("SELECT * FROM proxies WHERE id = ?", (proxy_id,)).fetchone()
+            return proxy_from_row(row) if row else None
+
+        return await self.run(read)
+
+    async def add_proxy(self, proxy: Proxy) -> Proxy:
+        """Insert a proxy, or return the existing row for the same URL.
+
+        The URL is the identity: pasting one twice is a slip, not a second proxy,
+        and the unique index would otherwise raise on the operator.
+        """
+
+        def write(conn: sqlite3.Connection) -> Proxy:
+            existing = conn.execute(
+                "SELECT * FROM proxies WHERE url = ?", (proxy.url,)
+            ).fetchone()
+            if existing:
+                return proxy_from_row(existing)
+            conn.execute(
+                """
+                INSERT INTO proxies
+                    (id, url, scheme, enabled, status, exit_ip, country, city, isp,
+                     latency_ms, checked_at, fail_count, used_count, last_used_at, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    proxy.id, proxy.url, proxy.scheme, int(proxy.enabled), proxy.status,
+                    proxy.exit_ip, proxy.country, proxy.city, proxy.isp, proxy.latency_ms,
+                    proxy.checked_at, proxy.fail_count, proxy.used_count, proxy.last_used_at,
+                    proxy.created_at,
+                ),
+            )
+            conn.commit()
+            return proxy
+
+        return await self.run(write)
+
+    async def update_proxy(self, proxy_id: str, apply_fn: Callable[[Proxy], None]) -> Proxy | None:
+        def write(conn: sqlite3.Connection) -> Proxy | None:
+            row = conn.execute("SELECT * FROM proxies WHERE id = ?", (proxy_id,)).fetchone()
+            if not row:
+                return None
+            proxy = proxy_from_row(row)
+            apply_fn(proxy)
+            conn.execute(
+                """
+                UPDATE proxies SET enabled=?, status=?, exit_ip=?, country=?, city=?,
+                    isp=?, latency_ms=?, checked_at=?, fail_count=?, used_count=?, last_used_at=?
+                WHERE id=?
+                """,
+                (
+                    int(proxy.enabled), proxy.status, proxy.exit_ip, proxy.country, proxy.city,
+                    proxy.isp, proxy.latency_ms, proxy.checked_at, proxy.fail_count,
+                    proxy.used_count, proxy.last_used_at, proxy_id,
+                ),
+            )
+            conn.commit()
+            return proxy
+
+        return await self.run(write)
+
+    async def delete_proxy(self, proxy_id: str) -> int:
+        def write(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+            conn.commit()
+            return cursor.rowcount
+
+        return await self.run(write)
+
+    # --------------------------------------------------------------- ip usage
+
+    async def ip_usage(self, ip: str) -> int:
+        def read(conn: sqlite3.Connection) -> int:
+            row = conn.execute("SELECT count FROM ip_usage WHERE ip = ?", (ip,)).fetchone()
+            return int(row["count"]) if row else 0
+
+        return await self.run(read)
+
+    async def list_ip_usage(self) -> list[IpUsage]:
+        def read(conn: sqlite3.Connection) -> list[IpUsage]:
+            rows = conn.execute("SELECT * FROM ip_usage ORDER BY last_at DESC").fetchall()
+            return [
+                IpUsage(ip=row["ip"], count=int(row["count"]), last_at=row["last_at"])
+                for row in rows
+            ]
+
+        return await self.run(read)
+
+    async def record_ip_use(self, ip: str) -> int:
+        """Count one registration against an exit address; return the new total."""
+        if not ip:
+            return 0
+
+        def write(conn: sqlite3.Connection) -> int:
+            conn.execute(
+                """
+                INSERT INTO ip_usage (ip, count, last_at) VALUES (?, 1, ?)
+                ON CONFLICT(ip) DO UPDATE SET count = count + 1, last_at = excluded.last_at
+                """,
+                (ip, time.time()),
+            )
+            conn.commit()
+            row = conn.execute("SELECT count FROM ip_usage WHERE ip = ?", (ip,)).fetchone()
+            return int(row["count"]) if row else 1
+
+        return await self.run(write)
+
+
+def proxy_from_row(row: sqlite3.Row) -> Proxy:
+    return Proxy(
+        id=row["id"],
+        url=row["url"],
+        scheme=row["scheme"],
+        enabled=bool(row["enabled"]),
+        status=row["status"],
+        exit_ip=row["exit_ip"],
+        country=row["country"],
+        city=row["city"],
+        isp=row["isp"],
+        latency_ms=row["latency_ms"],
+        checked_at=row["checked_at"],
+        fail_count=row["fail_count"],
+        used_count=row["used_count"],
+        last_used_at=row["last_used_at"],
+        created_at=row["created_at"],
+    )
+
 
 def _account_params(account: Account) -> tuple[Any, ...]:
     return (
@@ -727,6 +961,10 @@ def _account_params(account: Account) -> tuple[Any, ...]:
         account.token,
         account.user_id,
         account.identifier,
+        account.email,
+        account.password,
+        account.refresh_token,
+        account.token_expires_at,
         account.agent_id,
         account.device_id,
         account.uuid,
@@ -735,6 +973,7 @@ def _account_params(account: Account) -> tuple[Any, ...]:
         account.base_url,
         account.group,
         account.remark,
+        account.source,
         int(account.enabled),
         account.priority,
         account.max_concurrent,
@@ -798,6 +1037,10 @@ def _update_params(account: Account) -> tuple[Any, ...]:
         account.token,
         account.user_id,
         account.identifier,
+        account.email,
+        account.password,
+        account.refresh_token,
+        account.token_expires_at,
         account.agent_id,
         account.device_id,
         account.uuid,
@@ -806,6 +1049,7 @@ def _update_params(account: Account) -> tuple[Any, ...]:
         account.base_url,
         account.group,
         account.remark,
+        account.source,
         int(account.enabled),
         account.priority,
         account.max_concurrent,

@@ -268,8 +268,14 @@ class SigninPanel:
 
     @property
     def claimed_today(self) -> bool:
+        # The day's ``status`` is 1 for a day that cannot be claimed yet (a future
+        # day), 2 for today before it is claimed, and 3 once it has been claimed.
+        # So "already claimed" is status 3, not 1 — reading it as 1 says the
+        # opposite of the truth and sends a claim for a day already claimed, which
+        # is why a signed-in account kept asking the endpoint and the console kept
+        # showing the pre-claim balance.
         day = self.today
-        return bool(day and day.status == 1)
+        return bool(day and day.status == 3)
 
 
 @dataclass
@@ -287,9 +293,9 @@ class SigninClaim:
 
 @dataclass
 class CreditInfo:
-    total: int = 0
-    free: int = 0
-    purchased: int = 0
+    total: float = 0.0
+    free: float = 0.0
+    purchased: float = 0.0
     plan_name: str = ""
     plan_type: int = 0
 
@@ -393,6 +399,24 @@ def _int_of(value: Any) -> int:
         except ValueError:
             return 0
     return 0
+
+
+def _float_of(value: Any) -> float:
+    """Read a numeric field without dropping a fractional balance.
+
+    Balances arrive as decimal strings (``"1492.125"``); truncating one to an int
+    is the kind of quiet rounding that makes the console disagree with the site.
+    """
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def _str_of(value: Any) -> str:
@@ -1385,13 +1409,13 @@ class MiniMaxClient:
         )
         summary = core.get("op_credit_summary")
         if isinstance(summary, dict):
-            info.total = _int_of(summary.get("total_remaining_amount"))
-            info.free = _int_of(summary.get("free_remaining_amount"))
-            info.purchased = _int_of(summary.get("purchased_remaining_amount"))
+            info.total = _float_of(summary.get("total_remaining_amount"))
+            info.free = _float_of(summary.get("free_remaining_amount"))
+            info.purchased = _float_of(summary.get("purchased_remaining_amount"))
             return info
-        info.total = _int_of(core.get("opcredit_balance"))
+        info.total = _float_of(core.get("opcredit_balance"))
         if not info.total:
-            info.total = _int_of(core.get("total_remains_credit"))
+            info.total = _float_of(core.get("total_remains_credit"))
         return info
 
     async def credit_grants(self, cred: Credential) -> list[CreditGrant]:

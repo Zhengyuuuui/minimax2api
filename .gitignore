@@ -15,3 +15,8 @@ generated/
 
 # the bridge's own scratch
 .tmp-ref/
+
+# local configuration: secrets live here, the template does not
+.env
+.env.*
+!.env.example

@@ -13,6 +13,8 @@ import json
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
+from .records import PROXY_STRATEGIES
+
 # The web deployment's own clients are browsers, so the web profile presents one.
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -129,7 +131,10 @@ class SigninSettings:
     timeout_sec: int = 30
     skip_zero_credit: bool = False
     credit_fresh_min: int = 360
-    credit_refresh_min: int = 30
+    # How often a background pass re-reads balances that have gone stale.  Short
+    # on purpose: the console's balance is what an operator trusts, and a number
+    # that quietly disagrees with the website is worse than none.
+    credit_refresh_min: int = 5
     lang: str = "en"
     os_name: str = "Windows"
     browser_name: str = "Chrome"
@@ -147,12 +152,94 @@ class SigninSettings:
 
 
 @dataclass
+class SignupSettings:
+    """Headless account registration.
+
+    Creating an account is the one part of the bridge that talks to a service
+    other than MiniMax: an email address has to be obtained and read from
+    somewhere, and the temporary-mail worker is that somewhere.  The shape below
+    matches ``cloudflare_temp_email`` (``/admin/new_address`` with an
+    ``x-admin-auth`` header, ``/api/parsed_mails`` with a bearer JWT), which is
+    the deployed worker.
+
+    The MiniMax side needs nothing new: the register call is the same signed
+    ``account.minimax.io`` surface the device flow already reaches, and the token
+    it ends up with is imported through the existing OAuth path.
+    """
+
+    enabled: bool = True
+    # Region whose account service is registered against.  The two deployments
+    # have separate account databases, so registration is per-region like login.
+    region: str = "global"
+    # The temporary-mail service the headless registration reads codes from.
+    # Empty by default: an operator supplies their own via env
+    # (``MINIMAX2API_SIGNUP__MAIL_BASE`` / ``__MAIL_DOMAIN``), because a mail
+    # service is deployment-specific and shipping one address couples every
+    # install to it.
+    mail_base: str = ""
+    mail_domain: str = ""
+    mail_pass: str = ""
+    # Address prefix; a random suffix is appended so two runs cannot collide.
+    name_prefix: str = "mmx"
+    # How long to wait for a verification mail, and how often to look.
+    mail_timeout_sec: int = 120
+    mail_poll_sec: int = 3
+    # Set a password on the fresh account so a future re-login needs no mailbox.
+    password: str = ""
+    # OAuth grant the registration is authorised against, then imported.
+    oauth_scope: str = "agent.default"
+    oauth_audience: str = "agent-backend"
+    # ---- anti-throttle (proxy pool) ----
+    # Registration is counted per exit address by risk control, so accounts are
+    # spread across proxies and each address is capped.  ``0`` would mean "no
+    # limit", which is never what an operator wants silently, so the floor is 1.
+    use_proxies: bool = True
+    per_ip_limit: int = 3
+    proxy_strategy: str = "rotate"
+    # A proxy that fails this many checks in a row is skipped by the selector.
+    proxy_max_fail: int = 3
+    # Where the checkout asks what the world sees; used by the proxy checker.
+    proxy_check_url: str = "https://ipwho.is/"
+    # Registrations are serial and spaced: a burst from one process is itself a
+    # pattern, and this also keeps within the mail service's own rate limits.
+    batch_max: int = 20
+    gap_seconds: int = 3
+
+
+@dataclass
+class KeepaliveSettings:
+    """Renewal of the one-hour OAuth tokens.
+
+    Separate from ``signup`` because it applies to every account already in the
+    pool, however it arrived — the browser sign-in produces the same one-hour
+    token the headless registration does.
+    """
+
+    enabled: bool = True
+    # How often the background sweep looks for tokens near expiry.  The access
+    # token the site issues lives one hour (``expires_in=3600``); a half-hour
+    # sweep means each credential is renewed once an hour, not on every pass, so
+    # the refresh endpoint is touched twice an hour per account rather than every
+    # few minutes.  Renewal only happens for tokens inside the margin
+    # (``keepalive.REFRESH_MARGIN_SEC``, which must exceed this interval so a token
+    # cannot pass from "not yet due" to expired between two sweeps).
+    #
+    # This is deliberately independent of the balance refresh
+    # (``signin.credit_refresh_min``): keeping a credential alive and keeping a
+    # number current are separate jobs with separate failure modes, and one must
+    # not be tuned by changing the other.
+    interval_sec: int = 1800
+
+
+@dataclass
 class Settings:
     upstream: UpstreamSettings = field(default_factory=UpstreamSettings)
     routing: RoutingSettings = field(default_factory=RoutingSettings)
     audit: AuditSettings = field(default_factory=AuditSettings)
     media: MediaSettings = field(default_factory=MediaSettings)
     signin: SigninSettings = field(default_factory=SigninSettings)
+    signup: SignupSettings = field(default_factory=SignupSettings)
+    keepalive: KeepaliveSettings = field(default_factory=KeepaliveSettings)
 
 
 def default_settings(data_dir: str) -> Settings:
@@ -280,6 +367,33 @@ def normalize(settings: Settings, data_dir: str) -> bool:
     if not signin.credit_details_path:
         signin.credit_details_path = default.signin.credit_details_path
 
+    signup = settings.signup
+    if signup.region not in ("cn", "global"):
+        signup.region = default.signup.region
+    if not signup.mail_base:
+        signup.mail_base = default.signup.mail_base
+    if not signup.mail_domain:
+        signup.mail_domain = default.signup.mail_domain
+    if not signup.name_prefix:
+        signup.name_prefix = default.signup.name_prefix
+    signup.mail_timeout_sec = _int_range(signup.mail_timeout_sec, 10, 600, default.signup.mail_timeout_sec)
+    signup.mail_poll_sec = _int_range(signup.mail_poll_sec, 1, 60, default.signup.mail_poll_sec)
+    if not signup.oauth_scope:
+        signup.oauth_scope = default.signup.oauth_scope
+    if not signup.oauth_audience:
+        signup.oauth_audience = default.signup.oauth_audience
+    if signup.proxy_strategy not in PROXY_STRATEGIES:
+        signup.proxy_strategy = default.signup.proxy_strategy
+    signup.per_ip_limit = _int_range(signup.per_ip_limit, 1, 100, default.signup.per_ip_limit)
+    signup.proxy_max_fail = _int_range(signup.proxy_max_fail, 1, 50, default.signup.proxy_max_fail)
+    if not signup.proxy_check_url:
+        signup.proxy_check_url = default.signup.proxy_check_url
+    signup.batch_max = _int_range(signup.batch_max, 1, 200, default.signup.batch_max)
+    signup.gap_seconds = _int_range(signup.gap_seconds, 0, 3600, default.signup.gap_seconds)
+
+    keepalive = settings.keepalive
+    keepalive.interval_sec = _int_range(keepalive.interval_sec, 60, 86400, default.keepalive.interval_sec)
+
     return settings != before
 
 
@@ -307,7 +421,33 @@ SECTIONS = (
     "audit",
     "media",
     "signin",
+    "signup",
+    "keepalive",
 )
+
+# Fields whose value must not travel to the console in the clear.
+#
+# ``/admin/api/settings`` answers whoever can reach the port, and the process has
+# no auth of its own, so a value here is echoed as a placeholder: the console can
+# show that a secret is set and edit it, but a page that is open on a shared
+# screen is not handing out a mail passkey.  ``proxy`` is a URL that may embed a
+# password, so it is masked like the rest.
+SECRET_FIELDS = frozenset(
+    {
+        "signup.mail_pass",
+        "signup.password",
+        "upstream.proxy",
+    }
+)
+
+# The placeholder a secret is replaced with on the way out.  Chosen so it cannot
+# be mistaken for a real value: nothing sane sets a passkey to this text, and the
+# write path treats exactly this string as "leave it as it was".
+SECRET_MASK = "********"
+
+
+def is_secret(path: str) -> bool:
+    return path in SECRET_FIELDS
 
 
 def to_dict(settings: Settings) -> dict[str, Any]:
@@ -315,6 +455,30 @@ def to_dict(settings: Settings) -> dict[str, Any]:
     for section in SECTIONS:
         holder = getattr(settings, section)
         payload[section] = {item.name: getattr(holder, item.name) for item in fields(holder)}
+    return payload
+
+
+def to_dict_masked(settings: Settings, env_names: set[str] | None = None) -> dict[str, Any]:
+    """The console's view: secrets replaced, env-controlled fields flagged.
+
+    Two annotations ride along, both ``"_"-prefixed`` so they read as metadata
+    rather than something the settings form would try to submit:
+
+    - ``_secrets`` — the field paths that were masked, so the form knows which
+      inputs get a reveal control and which must be left alone when blank.
+    - ``_locked`` — paths the environment controls; the form renders them
+      read-only, because an edit here is accepted and then discarded.
+    """
+    payload = to_dict(settings)
+    masked: list[str] = []
+    for section, values in payload.items():
+        for field_name, value in list(values.items()):
+            path = f"{section}.{field_name}"
+            if is_secret(path) and value:
+                values[field_name] = SECRET_MASK
+                masked.append(path)
+    payload["_secrets"] = masked
+    payload["_locked"] = sorted(env_names or ())
     return payload
 
 
@@ -378,6 +542,11 @@ def apply_update(settings: Settings, payload: dict[str, Any]) -> bool:
             if not hasattr(holder, key):
                 continue
             current = getattr(holder, key)
+            # The console round-trips a masked secret back on save; writing the
+            # placeholder would destroy the real value, so it is read as "not
+            # provided".  Clearing a secret is done by sending an empty string.
+            if is_secret(f"{section}.{key}") and value == SECRET_MASK:
+                continue
             if isinstance(current, bool):
                 coerced = coerce_bool(value, current)
             elif isinstance(current, str) and isinstance(value, (str, int, float)):

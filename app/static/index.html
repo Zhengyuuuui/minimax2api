@@ -91,6 +91,8 @@
   .pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
   .pill.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
   .muted { color: var(--muted); }
+  .tiny { font-size: 11px; }
+  .stale { color: var(--bad); }
   .mono { font-family: ui-monospace, monospace; font-size: 12px; }
   .flash {
     position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
@@ -100,6 +102,9 @@
   .flash.bad { border-color: var(--bad); }
   .flash.ok { border-color: var(--ok); }
   img.gallery { width: 86px; height: 86px; object-fit: cover; border-radius: 7px; border: 1px solid var(--edge); }
+  .secret-field { display: flex; gap: 6px; align-items: stretch; }
+  .secret-field input { flex: 1 1 auto; }
+  .secret-field .reveal { flex: 0 0 auto; }
   @media (max-width: 640px) {
     main { padding: 12px; }
     .row > * { flex: 1 1 100%; }
@@ -111,8 +116,7 @@
 <header id="console-header">
   <h1>minimaxcode2api</h1>
   <nav id="nav">
-    <button data-view="dashboard" aria-selected="true">概览</button>
-    <button data-view="accounts">号池</button>
+    <button data-view="accounts" aria-selected="true">号池</button>
     <button data-view="models">模型</button>
     <button data-view="signin">签到</button>
     <button data-view="audits">审计</button>
@@ -125,7 +129,7 @@
 
 <main id="console">
 
-  <section id="view-dashboard">
+  <section id="view-accounts" hidden>
     <div class="panel">
       <h2>概览</h2>
       <div class="grid" id="stats-grid"></div>
@@ -137,9 +141,6 @@
         <tbody id="recent-audits"></tbody>
       </table>
     </div>
-  </section>
-
-  <section id="view-accounts" hidden>
     <div class="panel">
       <h2>浏览器登录</h2>
       <p class="muted" style="margin-top:0">点一下跳转 MiniMax 登录页，登录完成后账号自动进池子，不用去 devtools 抄 <code>_token</code>。</p>
@@ -153,6 +154,53 @@
         <div style="flex:0 0 auto"><label>&nbsp;</label><button id="device-cancel" class="ghost" hidden>取消</button></div>
       </div>
       <div id="device-status" style="margin-top:10px"></div>
+    </div>
+    <div class="panel">
+      <h2>无头注册 <span class="muted">（海外版）</span></h2>
+      <p class="muted" style="margin-top:0">
+        全程无浏览器：自动申请临时邮箱 → 收验证码 → 注册 → 用会话直接批准设备码 → 拿 OAuth token 入池。
+        仅支持海外版（<code>account.minimax.io</code>）。
+      </p>
+      <div class="row">
+        <div style="flex:1;min-width:220px"><label>邮箱服务 API 地址</label><input id="signup-mail-base" placeholder="https://xxx.workers.dev"></div>
+        <div style="flex:0 0 auto"><label>邮箱域名</label><input id="signup-mail-domain" placeholder="example.com" style="width:170px"></div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <div style="flex:0 0 auto"><label>Admin Passkey</label>
+          <span class="secret-field" style="width:220px">
+            <input id="signup-mail-pass" type="password" autocomplete="new-password" placeholder="管理密钥">
+            <button type="button" class="ghost reveal" data-reveal="signup-mail-pass">显示</button>
+          </span>
+        </div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="signup-mail-save" class="ghost">保存邮箱配置</button></div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <div><label>账号名称（可选）</label><input id="signup-name" placeholder="例如：批量号"></div>
+        <div><label>数量</label><input id="signup-count" type="number" min="1" max="20" value="1" style="width:80px"></div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="signup-start">开始注册</button></div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="signup-cancel" class="ghost" hidden>取消</button></div>
+      </div>
+      <div id="signup-status" style="margin-top:10px"></div>
+    </div>
+    <div class="panel">
+      <h2>代理池 <span id="proxy-count" class="muted"></span></h2>
+      <p class="muted" style="margin-top:0">
+        注册按<b>出口地址</b>被风控计数，池子让每个号从不同地址出去。地址上限在「设置」的
+        <code>signup.per_ip_limit</code>；不填代理则直连（同一地址，易触发风控）。
+      </p>
+      <div class="row">
+        <div style="flex:1;min-width:280px"><label>代理地址（每行一个，支持 socks5:// socks5h:// http:// https://）</label>
+          <textarea id="proxy-input" placeholder="socks5://user:pass@host:1080&#10;http://1.2.3.4:8080"></textarea></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="proxy-add">添加代理</button></div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="proxy-check-all" class="ghost">检测全部</button></div>
+        <div class="muted" id="proxy-usage" style="align-self:center"></div>
+      </div>
+      <table>
+        <thead><tr><th>代理</th><th>协议</th><th>出口 IP</th><th>归属</th><th>延迟</th><th>已注册</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody id="proxies-body"></tbody>
+      </table>
     </div>
     <div class="panel">
       <h2>手动导入 JWT</h2>
@@ -173,10 +221,29 @@ TOKEN2
       </p>
     </div>
     <div class="panel">
+      <h2>邮箱密码导入 <span class="muted">（批量）</span></h2>
+      <p class="muted" style="margin-top:0">
+        每行一个：<code>邮箱 密码</code>，也支持 <code>邮箱----密码</code>。导入时会用邮箱密码登录，
+        自动拿到 token 与 refresh_token 并入池——这类账号可以随时从控制台重新登录，不依赖浏览器。
+      </p>
+      <label>邮箱 + 密码（每行一个）</label>
+      <textarea id="pw-import-box" placeholder="a@example.com  Password123
+b@example.com----Password456"></textarea>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="pw-import-btn">导入</button></div>
+        <div class="muted" id="pw-import-status" style="align-self:center"></div>
+      </div>
+    </div>
+    <div class="panel">
       <h2>号池 <span id="account-count" class="muted"></span></h2>
+      <div class="row" style="margin-bottom:8px">
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="probe-all" class="ghost">全部探测</button></div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="credit-refresh-all" class="ghost">全部刷新余额</button></div>
+        <div class="muted" id="pool-action-status" style="align-self:center"></div>
+      </div>
       <table>
         <thead><tr>
-          <th>名称</th><th>区域</th><th>userId</th><th>agentId</th><th>状态</th>
+          <th>名称</th><th>区域</th><th>注册邮箱</th><th>密码</th><th>状态</th><th>续期</th>
           <th>并发</th><th>成功/失败</th><th>积分</th><th>签到</th><th>操作</th>
         </tr></thead>
         <tbody id="accounts-body"></tbody>
@@ -205,6 +272,14 @@ TOKEN2
         <div><label>&nbsp;</label><button id="signin-save">保存</button> <button id="signin-run" class="ghost">立即运行</button></div>
       </div>
       <p class="muted" style="font-size:12px;margin:10px 0 0" id="signin-status-line"></p>
+    </div>
+    <div class="panel">
+      <h2>余额刷新</h2>
+      <div class="row">
+        <div><label>自动刷新间隔（分钟）</label><input id="credit-interval" type="number" min="1" value="5"></div>
+        <div><label>&nbsp;</label><button id="credit-refresh" class="ghost">立即刷新全部</button></div>
+      </div>
+      <p class="muted" style="font-size:12px;margin:10px 0 0" id="credit-status-line"></p>
     </div>
     <div class="panel">
       <h2>最近一次运行</h2>
@@ -263,7 +338,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 const state = {
-  view: "dashboard",
+  view: "accounts",
   audits: { offset: 0, limit: 50, total: 0, model: "", outcome: "" },
   accounts: [],
 };
@@ -299,8 +374,29 @@ function timeAgo(isoString) {
   return Math.round(seconds / 86400) + " 天前";
 }
 
+// An absolute clock time, for a value that is a deadline rather than history.
+function shortTime(isoString) {
+  if (!isoString) return "-";
+  const date = new Date(isoString);
+  if (!date.getTime()) return "-";
+  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+
 function pill(text, kind = "") {
   return `<span class="pill ${kind}">${text}</span>`;
+}
+
+// Toggle one masked secret field between password and text.  The value is
+// already in the input (or is the server's mask); this only changes what is
+// drawn, so it never asks the server for a plaintext it did not already send.
+function revealSecret(button) {
+  const target = button.dataset.reveal;
+  const input = document.getElementById(target) ||
+    document.querySelector(`[data-setting="${target}"]`);
+  if (!input) return;
+  const shown = input.type === "text";
+  input.type = shown ? "password" : "text";
+  button.textContent = shown ? "显示" : "隐藏";
 }
 
 function signinPill(status) {
@@ -308,6 +404,42 @@ function signinPill(status) {
                 failed: ["失败", "bad"], skipped: ["跳过", "warn"] };
   const [label, kind] = map[status] || [status, ""];
   return pill(label, kind);
+}
+
+// The check-in column: when this account last actually checked in, and a button
+// that is always pressable.  A permanent "已签" badge is what makes an operator
+// believe an account is done when the last time it claimed was days ago; the
+// date answers that directly, and the button re-runs the claim on demand — the
+// endpoint is idempotent, so a second press answers "already" rather than
+// double-crediting.
+function signinCell(account) {
+  const when = account.signinAt
+    ? timeAgo(account.signinAt)
+    : "从未";
+  const badge = account.signinStatus ? signinPill(account.signinStatus) : "";
+  return (
+    `<button class="ghost small" data-act="signin" data-id="${account.id}">签到</button>` +
+    `<br><span class="tiny muted" title="上次签到">${when}</span> ${badge}`
+  );
+}
+
+// The balance and, underneath, how old that reading is.  A number without its
+// age is a number the operator cannot trust: the console refreshes stale
+// balances in the background, so an old one means that pass has not reached this
+// account yet, and a failed one has to be visible rather than silently stale.
+function creditCell(account) {
+  if (!account.credit) {
+    return `<button class="ghost small" data-act="credit" data-id="${account.id}">查余额</button>`;
+  }
+  const synced = account.credit.syncedAt;
+  const ageMs = synced ? Date.now() - new Date(synced).getTime() : Infinity;
+  const stale = ageMs > 6 * 60 * 1000;
+  const cls = stale ? "stale" : "muted";
+  const label = account.credit.total;
+  return (
+    `<span title="未消费额度">${label}</span>` +
+    `<br><span class="tiny ${cls}" title="余额读取时间">${synced ? timeAgo(synced) + "更新" : "从未读取"}</span>`
+  );
 }
 
 function statusPill(status) {
@@ -319,6 +451,42 @@ function statusPill(status) {
   };
   const [label, kind] = map[status] || [status, ""];
   return pill(label || status, kind);
+}
+
+function statusPill(status) {
+// facts, not one.  The stored ``status`` is the last runtime verdict (active,
+// cooling down, refused).  ``renewable`` is whether there is any path back to a
+// fresh credential at all.
+// The status column answers "can this account still serve traffic", which is two
+// facts, not one.  The stored ``status`` is the last runtime verdict (active,
+// cooling down, refused).  ``renewable`` is whether there is any path back to a
+// fresh credential at all.
+//
+// An enabled account that cannot renew is the dangerous case: it looks active
+// right now because its token has not expired yet, and the moment it does it is
+// dead with no way back.  That pair is drawn red regardless of the stored status,
+// because the operator's action — re-add the credential — is the same whichever
+// it is.
+function statusCell(account) {
+  if (account.enabled && !account.renewable) {
+    return pill("需续期凭据", "bad") +
+      `<br><span class="tiny muted" title="没有 refresh_token，也没有邮箱+密码">不可续期</span>`;
+  }
+  return statusPill(account.status);
+}
+
+// How the account arrived, so an operator can tell a password account (always
+// re-signable from the console) from a browser sign-in (a token that only lives
+// as long as its refresh token does).
+function sourceBadge(source) {
+  const map = {
+    password: ["密码导入", "ok"],
+    signup: ["注册", ""],
+    device: ["网页登录", "warn"],
+    token: ["令牌", "warn"],
+  };
+  const [label, kind] = map[source] || ["令牌", "warn"];
+  return `<span class="tiny">${pill(label, kind)}</span>`;
 }
 
 function row(cells) {
@@ -350,7 +518,6 @@ $("#nav").addEventListener("click", (event) => {
 
 async function render() {
   try {
-    if (state.view === "dashboard") return await renderDashboard();
     if (state.view === "accounts") return await renderAccounts();
     if (state.view === "models") return await renderModels();
     if (state.view === "signin") return await renderSignin();
@@ -390,22 +557,28 @@ async function renderDashboard() {
 }
 
 async function renderAccounts() {
+  await renderDashboard();
   state.accounts = await api("/admin/api/accounts");
+  await renderProxies();
+  await loadSignupMail();
   $("#account-count").textContent = "(" + state.accounts.length + ")";
   $("#accounts-body").innerHTML = state.accounts.map((account) => row([
-    `<b>${account.name || account.id.slice(0, 8)}</b>`,
+    `<b>${account.name || account.id.slice(0, 8)}</b><br>${sourceBadge(account.source)}`,
     account.region,
-    `<span class="mono">${account.userId || "-"}</span>`,
-    `<span class="mono">${account.agentID || "-"}</span>`,
-    statusPill(account.status),
+    `<span class="mono">${account.email || account.identifier || "-"}</span>`,
+    account.passwordMasked
+      ? `<span class="mono" data-pw="${account.id}">${account.passwordMasked}</span> <button class="ghost small" data-act="reveal-password" data-id="${account.id}" title="显示明文">显示</button>`
+      : `<span class="muted">-</span>`,
+    statusCell(account),
+    account.kind === "oauth"
+      ? (account.renewable
+          ? `<span class="mono" title="token 到期时间">${account.tokenExpiresAt ? shortTime(account.tokenExpiresAt) : "未记录"}</span> <button class="ghost small" data-act="renew" data-id="${account.id}">续期</button>`
+          : `<span class="muted" title="没有 refresh_token，也没有邮箱+密码">不可续</span>`)
+      : `<span class="muted">-</span>`,
     `${account.inflight}/${account.maxConcurrent}`,
     `${account.successCount}/${account.failCount}`,
-    account.credit
-      ? account.credit.total
-      : `<button class="ghost small" data-act="credit" data-id="${account.id}">查余额</button>`,
-    account.signinStatus
-      ? signinPill(account.signinStatus)
-      : `<button class="ghost small" data-act="signin" data-id="${account.id}">查签到</button>`,
+    creditCell(account),
+    signinCell(account),
     [
       `<button class="ghost small" data-act="probe" data-id="${account.id}">探测</button>`,
       `<button class="ghost small" data-act="${account.enabled ? "disable" : "enable"}" data-id="${account.id}">${account.enabled ? "停用" : "启用"}</button>`,
@@ -441,6 +614,16 @@ async function renderSignin() {
   $("#signin-status-line").textContent = status.running
     ? "正在运行…"
     : "下次运行：" + (status.nextRunAt || "-");
+
+  const credit = await api("/admin/api/credit");
+  if (document.activeElement !== $("#credit-interval")) {
+    $("#credit-interval").value = credit.intervalMin || 5;
+  }
+  const lastCredit = credit.lastRun;
+  $("#credit-status-line").textContent = lastCredit
+    ? `上次刷新：${timeAgo(new Date(lastCredit.at * 1000).toISOString())}`
+      + `（成功 ${lastCredit.refreshed || 0}，跳过 ${lastCredit.skipped || 0}，失败 ${lastCredit.failed || 0}）`
+    : `每 ${credit.intervalMin || 5} 分钟自动刷新过期余额`;
 
   const last = status.lastRun;
   if (!last) {
@@ -513,31 +696,86 @@ const SETTING_LABELS = {
   "audit.max_records": "审计最大条数",
   "media.auto_download": "自动下载素材",
   "media.max_total_size_mb": "素材目录上限（MB）",
+  "signup.enabled": "启用无头注册",
+  "signup.region": "注册区域（global/cn）",
+  "signup.mail_base": "邮箱服务 API 地址",
+  "signup.mail_domain": "邮箱域名",
+  "signup.mail_pass": "邮箱服务 Admin Passkey",
+  "signup.name_prefix": "邮箱/账号名前缀",
+  "signup.mail_timeout_sec": "等待验证码超时（秒）",
+  "signup.mail_poll_sec": "收件轮询间隔（秒）",
+  "signup.password": "新账号初始密码（可空）",
+  "signup.use_proxies": "注册走代理池",
+  "signup.per_ip_limit": "每出口 IP 注册上限",
+  "signup.proxy_strategy": "代理选择策略（rotate/random/single）",
+  "signup.proxy_check_url": "代理检测 URL",
+  "signup.batch_max": "单批最大数量",
+  "signup.gap_seconds": "批量注册间隔（秒）",
+  "keepalive.enabled": "启用 Token 保活",
+  "keepalive.interval_sec": "保活巡检间隔（秒）",
 };
 
 async function renderSettings() {
   const settings = await api("/admin/api/settings");
   const form = $("#settings-form");
   form.innerHTML = "";
+  const secrets = new Set(settings._secrets || []);
+  const locked = new Set(settings._locked || []);
+  if (locked.size) {
+    form.insertAdjacentHTML(
+      "beforeend",
+      `<p class="muted" style="margin:0 0 10px">带 <span class="pill">env</span> 的项由环境变量提供，修改不会生效（改 <code>.env</code> 或进程环境）。</p>`
+    );
+  }
   for (const [key, label] of Object.entries(SETTING_LABELS)) {
     const section = key.split(".")[0];
     const value = settings[section][key.split(".")[1]];
     const isBool = typeof value === "boolean";
-    const input = isBool
-      ? `<input type="checkbox" data-setting="${key}" ${value ? "checked" : ""} style="width:auto">`
-      : `<input data-setting="${key}" value="${value ?? ""}" type="${typeof value === "number" ? "number" : "text"}">`;
-    form.insertAdjacentHTML("beforeend", `<label>${label}</label>${input}`);
+    const isSecret = secrets.has(key);
+    const isLocked = locked.has(key);
+    let input;
+    if (isBool) {
+      input = `<input type="checkbox" data-setting="${key}" ${value ? "checked" : ""} ${isLocked ? "disabled" : ""} style="width:auto">`;
+    } else if (isSecret) {
+      // Masked on arrival; typing replaces it, leaving it blank keeps it.  The
+      // reveal button is a real toggle, not a value fetch — the plaintext is
+      // never in this page unless the operator is already looking at it.
+      input = `<span class="secret-field">
+        <input data-setting="${key}" type="password" value="${value ?? ""}" autocomplete="new-password" ${isLocked ? "disabled" : ""}>
+        <button type="button" class="ghost reveal" data-reveal="${key}">显示</button>
+      </span>`;
+    } else {
+      input = `<input data-setting="${key}" value="${value ?? ""}" type="${typeof value === "number" ? "number" : "text"}" ${isLocked ? "disabled" : ""}>`;
+    }
+    form.insertAdjacentHTML(
+      "beforeend",
+      `<label>${label}${isLocked ? ' <span class="pill">env</span>' : ""}</label>${input}`
+    );
   }
+  $$("[data-reveal]", form).forEach((button) => {
+    button.addEventListener("click", () => revealSecret(button));
+  });
   form.insertAdjacentHTML("beforeend", `<button id="settings-save">保存</button>`);
   $("#settings-save").addEventListener("click", async () => {
     const payload = {};
     $$("[data-setting]", form).forEach((input) => {
+      // A disabled input is an env-controlled one; sending it would look like an
+      // edit that quietly did nothing.
+      if (input.disabled) return;
       const [section, name] = input.dataset.setting.split(".");
       payload[section] = payload[section] || {};
       payload[section][name] = input.type === "checkbox" ? input.checked : input.value;
     });
     try {
-      await api("/admin/api/settings", { method: "POST", body: JSON.stringify(payload) });
+      const updated = await api("/admin/api/settings", { method: "POST", body: JSON.stringify(payload) });
+      const stillMasked = new Set(updated._secrets || []);
+      $$("[data-setting]", form).forEach((input) => {
+        const [section, name] = input.dataset.setting.split(".");
+        if (stillMasked.has(`${section}.${name}`) && input.type !== "checkbox") {
+          input.value = updated[section][name];
+          input.type = "password";
+        }
+      });
       flash("设置已保存");
     } catch (err) {
       flash(err.message, "bad");
@@ -641,6 +879,246 @@ function renderDevice(session) {
     </p>`;
 }
 
+/* --- headless registration: no browser, no click, poll the same way --------- */
+
+let signupTimer = null;
+let signupId = null;
+
+/* Mail config lives in the settings document, but this panel is where it is
+   used, so it is edited here too.  The passkey field is masked on arrival; a
+   blank submit leaves it unchanged (see the settings save path). */
+async function loadSignupMail() {
+  try {
+    const settings = await api("/admin/api/settings");
+    $("#signup-mail-base").value = settings.signup.mail_base || "";
+    $("#signup-mail-domain").value = settings.signup.mail_domain || "";
+    const pass = settings.signup.mail_pass || "";
+    $("#signup-mail-pass").value = pass;
+    const locked = new Set(settings._locked || []);
+    for (const [id, key] of [["signup-mail-base", "signup.mail_base"], ["signup-mail-domain", "signup.mail_domain"], ["signup-mail-pass", "signup.mail_pass"]]) {
+      const input = $("#" + id);
+      if (input) input.disabled = locked.has(key);
+    }
+    $("#signup-mail-save").disabled = ["signup.mail_base", "signup.mail_domain", "signup.mail_pass"].some((k) => locked.has(k));
+  } catch (err) {
+    /* the settings tab reports its own errors; this is a convenience mirror */
+  }
+}
+
+$("#signup-mail-save").addEventListener("click", async () => {
+  try {
+    await api("/admin/api/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        signup: {
+          mail_base: $("#signup-mail-base").value.trim(),
+          mail_domain: $("#signup-mail-domain").value.trim(),
+          mail_pass: $("#signup-mail-pass").value,
+        },
+      }),
+    });
+    flash("邮箱配置已保存");
+    await loadSignupMail();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+});
+
+// The mail panel's reveal button is static, so it is wired once here; the
+// settings form wires its own because it is rebuilt on every render.
+$('.reveal[data-reveal="signup-mail-pass"]').addEventListener("click", (e) => revealSecret(e.currentTarget));
+
+$("#signup-start").addEventListener("click", async () => {
+  const button = $("#signup-start");
+  button.disabled = true;
+  $("#signup-status").innerHTML = '<span class="muted">正在创建邮箱并注册…</span>';
+  try {
+    const session = await api("/admin/api/signup", {
+      method: "POST",
+      body: JSON.stringify({
+        name: $("#signup-name").value.trim(),
+        region: "global",
+        count: parseInt($("#signup-count").value, 10) || 1,
+      }),
+    });
+    signupId = session.id;
+    $("#signup-cancel").hidden = false;
+    renderSignup(session);
+    if (signupTimer) clearInterval(signupTimer);
+    signupTimer = setInterval(pollSignup, 2000);
+  } catch (err) {
+    $("#signup-status").innerHTML = `<span class="pill bad">失败</span> <span class="muted">${err.message}</span>`;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#signup-cancel").addEventListener("click", async () => {
+  if (!signupId) return;
+  try {
+    renderSignup(await api(`/admin/api/signup/${signupId}`, { method: "DELETE" }));
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+});
+
+async function pollSignup() {
+  if (!signupId) return;
+  let session;
+  try {
+    session = await api(`/admin/api/signup/${signupId}`);
+  } catch (err) {
+    stopSignupPolling();
+    $("#signup-status").innerHTML = `<span class="pill bad">失败</span> <span class="muted">${err.message}</span>`;
+    return;
+  }
+  renderSignup(session);
+  if (session.status !== "pending") {
+    stopSignupPolling();
+    if (session.status === "registered") {
+      flash("已注册并入池：" + (session.registered || 1) + " 个（" + (session.accountName || session.email || session.accountId) + "）", "ok");
+      $("#signup-name").value = "";
+      await renderAccounts();
+      await renderProxies();
+    } else {
+      flash(session.error || "注册未完成", "bad");
+      await renderProxies();
+    }
+  }
+}
+
+function stopSignupPolling() {
+  if (signupTimer) clearInterval(signupTimer);
+  signupTimer = null;
+  $("#signup-cancel").hidden = true;
+}
+
+function renderSignup(session) {
+  const kind = { pending: "", registered: "ok", failed: "bad", canceled: "" };
+  const hints = {
+    canceled: "已取消。",
+    failed: "若提示网络/邮箱错误，先检查「设置」里的邮箱服务与 proxy（国际站锁海外出口）。",
+  };
+  const secs = Math.round((session.elapsedMs || 0) / 1000);
+  $("#signup-status").innerHTML = `
+    <div class="row" style="align-items:center">
+      <div style="flex:0 0 auto">${pill(session.status, kind[session.status] || "")}</div>
+      <div style="flex:0 0 auto" class="muted">${session.step || ""}</div>
+      <div style="flex:0 0 auto" class="muted">${session.email || ""}</div>
+      <div class="muted" style="flex:0 0 auto">${secs}s</div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:8px 0 0">
+      ${session.accountName ? "已入池：" + session.accountName + "（" + session.accountId + "）" : ""}
+      ${session.error ? " " + session.error : ""}
+      ${hints[session.status] || ""}
+    </p>`;
+}
+
+/* --------------------------------------------------------------- proxy pool */
+
+$("#proxy-add").addEventListener("click", async () => {
+  const raw = $("#proxy-input").value.trim();
+  if (!raw) return flash("请粘贴至少一个代理地址", "bad");
+  try {
+    const result = await api("/admin/api/proxies", {
+      method: "POST",
+      body: JSON.stringify({ urls: raw.split("\n").map((s) => s.trim()).filter(Boolean) }),
+    });
+    const bad = (result.results || []).filter((r) => !r.ok);
+    if (bad.length) flash(`已添加 ${result.added} 个，${bad.length} 个被拒（${bad[0].reason}）`, "bad");
+    else flash(`已添加 ${result.added} 个代理，点「检测全部」刷新出口 IP`);
+    $("#proxy-input").value = "";
+    await renderProxies();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+});
+
+$("#proxy-check-all").addEventListener("click", async () => {
+  const button = $("#proxy-check-all");
+  button.disabled = true;
+  button.textContent = "检测中…";
+  try {
+    const result = await api("/admin/api/proxies/check-all", { method: "POST" });
+    flash(`检测完成：${result.ok}/${result.checked.length} 个可用`);
+    await renderProxies();
+  } catch (err) {
+    flash(err.message, "bad");
+  } finally {
+    button.disabled = false;
+    button.textContent = "检测全部";
+  }
+});
+
+async function checkOneProxy(id) {
+  try {
+    const result = await api(`/admin/api/proxies/${id}/check`, { method: "POST" });
+    flash(result.ok ? `可用：出口 ${result.exitIp}（${result.latencyMs}ms）` : `不可用：${result.error}`, result.ok ? "ok" : "bad");
+    await renderProxies();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+}
+
+async function toggleProxy(id, enabled) {
+  try {
+    await api(`/admin/api/proxies/${id}`, { method: "PATCH", body: JSON.stringify({ enabled }) });
+    await renderProxies();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+}
+
+async function removeProxy(id) {
+  if (!confirm("从代理池删除该代理？")) return;
+  try {
+    await api(`/admin/api/proxies/${id}`, { method: "DELETE" });
+    await renderProxies();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+}
+
+async function renderProxies() {
+  const body = $("#proxies-body");
+  if (!body) return;
+  let data;
+  try {
+    data = await api("/admin/api/proxies");
+  } catch (err) {
+    body.innerHTML = `<tr><td colspan="8" class="empty">${err.message}</td></tr>`;
+    return;
+  }
+  const list = data.proxies || [];
+  $("#proxy-count").textContent = list.length ? `(${list.length})` : "";
+  const usage = (data.ipUsage || []).map((u) => `${u.ip}: ${u.count}`).join(" · ");
+  $("#proxy-usage").textContent = usage ? "已用地址 → " + usage : "";
+  if (!list.length) {
+    body.innerHTML = '<tr><td colspan="8" class="empty">暂无代理，注册将直连（同一出口地址，易触发风控）</td></tr>';
+    return;
+  }
+  const kind = { ok: "ok", bad: "bad" };
+  body.innerHTML = list
+    .map((p) => {
+      const status = p.status === "unknown" ? "未检测" : p.status === "ok" ? "可用" : "不可用";
+      const geo = [p.country, p.city].filter(Boolean).join(" ");
+      const toggle = p.enabled ? "停用" : "启用";
+      return `<tr>
+        <td style="font-family:ui-monospace,monospace;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.url.replace(/\/\/[^@]*@/, "//***@")}</td>
+        <td>${p.scheme}</td>
+        <td>${p.exitIp || "-"}</td>
+        <td>${geo || "-"}</td>
+        <td>${p.latencyMs ? p.latencyMs + "ms" : "-"}</td>
+        <td>${p.usedCount || 0}</td>
+        <td>${pill(status, kind[p.status] || "")}${p.enabled ? "" : ' <span class="muted">停用</span>'}</td>
+        <td>${p.enabled ? `<button class="ghost" onclick="checkOneProxy('${p.id}')">检测</button>` : ""}
+            <button class="ghost" onclick="toggleProxy('${p.id}', ${p.enabled ? "false" : "true"})">${toggle}</button>
+            <button class="danger" onclick="removeProxy('${p.id}')">删除</button></td>
+      </tr>`;
+    })
+    .join("");
+}
+
 $("#import-btn").addEventListener("click", async () => {
   const raw = $("#import-box").value.trim();
   if (!raw) return flash("请粘贴至少一个 token", "bad");
@@ -670,6 +1148,32 @@ $("#import-btn").addEventListener("click", async () => {
   }
 });
 
+$("#pw-import-btn").addEventListener("click", async () => {
+  const raw = $("#pw-import-box").value.trim();
+  if (!raw) return flash("请粘贴至少一行 邮箱 密码", "bad");
+  $("#pw-import-btn").disabled = true;
+  $("#pw-import-status").textContent = "正在登录并导入…";
+  try {
+    const result = await api("/admin/api/accounts/password", {
+      method: "POST",
+      body: JSON.stringify({ accounts: raw }),
+    });
+    const failed = (result.results || []).filter((item) => !item.ok);
+    $("#pw-import-status").textContent = `成功 ${result.imported}/${result.total}`;
+    flash(
+      `密码导入 ${result.imported} 个${failed.length ? "，失败 " + failed.length + " 个：" + failed[0].reason : ""}`,
+      failed.length ? "bad" : "ok",
+    );
+    if (result.imported) $("#pw-import-box").value = "";
+    await renderAccounts();
+  } catch (err) {
+    flash(err.message, "bad");
+    $("#pw-import-status").textContent = "";
+  } finally {
+    $("#pw-import-btn").disabled = false;
+  }
+});
+
 $("#accounts-body").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-act]");
   if (!button) return;
@@ -677,6 +1181,46 @@ $("#accounts-body").addEventListener("click", async (event) => {
   try {
     if (act === "delete") {
       await api("/admin/api/accounts", { method: "DELETE", body: JSON.stringify({ ids: [id] }) });
+      await renderAccounts();
+      return;
+    }
+    if (act === "reveal-password") {
+      // Fetched on demand rather than shipped with the list: the plaintext
+      // leaves the server only when the operator asks to see it.
+      const result = await api(`/admin/api/accounts/${id}/password`);
+      const cell = document.querySelector(`[data-pw="${id}"]`);
+      if (cell) {
+        if (result.password) {
+          cell.textContent = result.password;
+          cell.title = "明文（点「隐藏」恢复）";
+          button.textContent = "隐藏";
+          button.dataset.act = "hide-password";
+        } else {
+          flash("该账号没有保存密码", "bad");
+        }
+      }
+      return;
+    }
+    if (act === "hide-password") {
+      await renderAccounts();
+      return;
+    }
+    if (act === "renew") {
+      // Renewal can take a few seconds: refresh grant first, password sign-in
+      // as the fallback, and each is a round trip to the account service.
+      button.disabled = true;
+      button.textContent = "续期中…";
+      try {
+        const result = await api(`/admin/api/accounts/${id}/renew`, { method: "POST", body: "{}" });
+        flash(
+          result.ok
+            ? `续期成功（${result.method === "refresh" ? "refresh_token" : "密码重登"}），到期 ${shortTime(result.expiresAt)}`
+            : `续期失败：${result.error || "未知原因"}`,
+          result.ok ? "ok" : "bad"
+        );
+      } catch (err) {
+        flash(err.message, "bad");
+      }
       await renderAccounts();
       return;
     }
@@ -688,7 +1232,9 @@ $("#accounts-body").addEventListener("click", async (event) => {
           : `余额 ${result.total ?? 0}（套餐 ${result.planName || "-"}）`,
           result.ok === false ? "bad" : "ok");
       } else if (act === "signin") {
-        flash(`签到：${result.status || "?"}${result.reason ? " — " + result.reason : ""}`,
+        const label = { ok: "签到成功", already: "今天已签", unpaid: "已签但未发放",
+                        failed: "签到失败", skipped: "已跳过" }[result.status] || "签到结果未知";
+        flash(`${label}${result.points ? " +" + result.points : ""}${result.reason ? " — " + result.reason : ""}`,
               result.status === "ok" || result.status === "already" ? "ok" : "bad");
       } else {
         flash(result.ok === false ? (result.error || "失败") : "成功", result.ok === false ? "bad" : "ok");
@@ -730,6 +1276,7 @@ $("#signin-save").addEventListener("click", async () => {
           hour: Number.isFinite(hour) ? hour : 9,
           minute: Number.isFinite(minute) ? minute : 5,
           gap_seconds: Number($("#signin-gap").value || 0),
+          credit_refresh_min: Math.max(1, Number($("#credit-interval").value || 5)),
         },
       }),
     });
@@ -750,6 +1297,63 @@ $("#signin-run").addEventListener("click", async () => {
     flash(err.message, "bad");
   } finally {
     $("#signin-run").disabled = false;
+  }
+});
+
+$("#credit-refresh").addEventListener("click", async () => {
+  $("#credit-refresh").disabled = true;
+  try {
+    // Name every enabled account so the refresh ignores freshness and reads live.
+    const ids = (state.accounts || []).map((account) => account.id);
+    const body = ids.length ? JSON.stringify({ accountIds: ids }) : "{}";
+    const result = await api("/admin/api/credit/refresh", { method: "POST", body });
+    flash(`余额已刷新：成功 ${result.refreshed || 0}，失败 ${result.failed || 0}`);
+    await renderAccounts();
+    await renderSignin();
+  } catch (err) {
+    flash(err.message, "bad");
+  } finally {
+    $("#credit-refresh").disabled = false;
+  }
+});
+
+$("#credit-refresh-all").addEventListener("click", async () => {
+  const button = $("#credit-refresh-all");
+  button.disabled = true;
+  $("#pool-action-status").textContent = "正在刷新余额…";
+  try {
+    // Name every account so the refresh ignores freshness and reads live.
+    const ids = state.accounts.map((account) => account.id);
+    const result = await api("/admin/api/credit/refresh", {
+      method: "POST",
+      body: JSON.stringify({ accountIds: ids }),
+    });
+    $("#pool-action-status").textContent =
+      `成功 ${result.refreshed || 0}，失败 ${result.failed || 0}`;
+    await renderAccounts();
+  } catch (err) {
+    flash(err.message, "bad");
+    $("#pool-action-status").textContent = "";
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#probe-all").addEventListener("click", async () => {
+  const button = $("#probe-all");
+  button.disabled = true;
+  $("#pool-action-status").textContent = "正在逐个探测…";
+  try {
+    const result = await api("/admin/api/accounts/probe-all", { method: "POST", body: "{}" });
+    $("#pool-action-status").textContent =
+      `探测完成：可用 ${result.okCount || 0}/${result.total || 0}`;
+    flash(`探测完成：可用 ${result.okCount || 0}/${result.total || 0}`);
+    await renderAccounts();
+  } catch (err) {
+    flash(err.message, "bad");
+    $("#pool-action-status").textContent = "";
+  } finally {
+    button.disabled = false;
   }
 });
 

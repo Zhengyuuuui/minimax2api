@@ -2,6 +2,27 @@
 
 > MiniMax Agent 多账号反代网关 — 账号池调度、设备指纹对齐官方客户端、双认证路径（Web JWT / 设备流 OAuth）、浏览器一键登录、支持 OpenAI / Anthropic 协议与标准客户端。
 
+## 📝 更新日志
+
+### 本次更新（账号池健康 · 保活 · 额度 · 签到）
+
+- **取消请求泄漏修复**：流式请求被客户端中断时，`CancelledError` 会绕过 `pool.release`，导致账号的 `inflight` 永久 +1。单账号 `max_concurrent=1` 时整个号池被钉死，之后所有 chat 卡住且无日志。现在 `gateway._run` 用 `try/finally` 保证租约必定归还。
+- **Token 保活（keepalive）**：
+  - Access token 实测存活 **1 小时**（`expires_in=3600`），refresh token 每次续期轮换。
+  - 保活巡检 **30 分钟一次**（`keepalive.interval_sec`），提前 **40 分钟**续期（`REFRESH_MARGIN_SEC`），失败 120 秒后重试——不高频打扰 RT 端点。
+  - 续期优先用 refresh token；失败/缺失时**自动回退到邮箱+密码登录**，并重新铸造 refresh token。
+  - 只保活 **enabled** 账号，停用账号不占用请求。
+- **额度（credits）获取与保活分离**：额度**每 5 分钟**独立刷新（`signin.credit_refresh_min`），含停用账号；余额改为 **float**，不再截断小数（如 `1492.125`）。
+- **签到**：
+  - 修复 `claimed_today` 判定写反（`status==1` → `status==3`）——此前"已签"被当成"未签"，反复请求 claim。
+  - 签到按钮**可反复点击**，已签返回 `already`（幂等，不重复发放）；签到后**重读余额**并在控制台显示最新值。
+  - **注册成功后自动签到一次**，领取首日额度；之后由控制台手动签到。
+- **导入来源区分**：账号新增 `source` 字段（`signup` / `password` / `device` / `token`），控制台以标签显示，明确哪些可凭邮箱密码重登、哪些依赖 refresh token。
+- **邮箱密码批量导入**：控制台新增输入框，每行 `邮箱 密码` 或 `邮箱----密码`，导入时自动登录换取 token + refresh token 入池。
+- **网页登录导入修复**：设备流响应中的 refresh token 之前被丢弃，导致网页导入的账号"不可续"。现在会连同 `expires_in` 一起保存。
+- **控制台合并与提示**：首页即号池（概览面板并入）；余额、签到、状态列显示相对时间与红色警示（掉凭据的 enabled 账号标红）。
+- **安全脱敏**：邮箱服务地址/域名/密钥从代码与示例中移除，改由环境变量提供。
+
 ## 🔧 官方客户端指纹模拟
 
 代理请求默认模拟官方客户端的请求特征，避免流量特征与官方差异过大触发风控：
@@ -25,7 +46,9 @@
 - **浏览器一键登录**：OAuth2 设备码流程（PKCE S256），点按钮跳转官方授权页，登录完成后账号自动入池，无需手动复制 `_token`
 - **协议转换**：OpenAI Chat Completions + Anthropic Messages，支持流式（SSE）
 - **媒体本地化**：上游生成的图片 URL 几小时后过期，自动下载到本地并按 `/media/<id>` 提供
-- **每日签到**：多账号自动签到、积分核查、大陆区账号自动跳过
+- **每日签到**：多账号自动签到、积分核查、大陆区账号自动跳过；注册成功自动签一次，其余可在控制台手动签到
+- **Token 保活**：refresh token 优先、邮箱密码兜底，30 分钟巡检、提前 40 分钟续期，账号不会因一小时 token 过期而死
+- **额度刷新**：每 5 分钟独立刷新余额（含停用账号），控制台显示最近读取时间
 - **管理控制台**：单文件 HTML（无构建步骤），号池 / 模型 / 签到 / 审计 / 画廊 / 设置
 
 ## 目录结构
@@ -39,7 +62,11 @@ minimaxcode2api/
 │   ├── gateway.py         # OpenAI / Anthropic 协议转换与故障转移
 │   ├── pool.py            # 账号池调度、冷却与健康状态机
 │   ├── device_login.py    # OAuth2 设备码登录流程
+│   ├── signup.py          # 无头注册（邮箱验证码 + 自动设备码授权）
+│   ├── proxy.py           # 代理池：解析 / 检测 / 轮换
+│   ├── env.py             # 环境变量覆盖与 .env 读取
 │   ├── signin.py          # 每日签到与积分核查
+│   ├── keepalive.py       # OAuth token 保活（refresh / 密码兜底）
 │   ├── admin.py           # 管理 API
 │   ├── media.py           # 生成媒体下载与本地索引
 │   ├── prompt.py          # OpenAI 消息 → 上游单串 prompt
@@ -51,6 +78,7 @@ minimaxcode2api/
 │   └── static/index.html  # 单文件控制台
 ├── tests/
 ├── run.py
+├── .env.example
 └── requirements.txt
 ```
 
@@ -96,6 +124,35 @@ python run.py --port 4555
 导入时若勾选「自动探测」，会调用上游读取 `realUserID` 与 agent 列表，解析出 `agent_id`（优先 `mavis` 角色）。逐账号约 1–3 秒。
 
 > **网络要求**：海外版业务接口锁海外出口，本机不在海外时请先在「设置」中填写 `proxy`，否则探测必定 401；国内版直连即可。该设置只影响代理，账号服务本身可直连。回环地址自动绕过代理。
+
+**方式 C：无头注册（自动造号入池）**
+
+控制台「号池」→「无头注册」→ 选区域 / 数量 →「开始注册」。全程无浏览器：
+
+1. 向临时邮箱服务要一个地址（`signup.mail_base` / `mail_domain` / `mail_pass`）；
+2. `POST /v1/api/user/login/sms/send` 取邮箱验证码；
+3. `POST /oauth2/login`（`loginType=21`）验证即注册，拿到 `_sid` 会话；
+4. 服务端用该会话走**设备码流程**（`/oauth2/device/code` → `GET/POST /oauth2/device/authorize` → `/oauth2/token`）换出 OAuth `access_token`；
+5. 交给现有 `import_device_token` 入池——与浏览器一键登录产出同一种账号。
+
+> 该 build 的腾讯验证码被编译关闭（`h.Xy=false`），故发码无需验证码；`cn` 区 build 会拉起验证码，是另一条路。
+
+**方式 D：邮箱密码批量导入**
+
+控制台「号池」→「邮箱密码导入」，每行一个 `邮箱 密码`（也支持 `邮箱----密码`）。导入时用邮箱密码**自动登录**换取 access token 与 refresh token 入池：
+
+- 这类账号 `source=password`，**不依赖浏览器**，随时可从控制台重新登录，最稳。
+- 与网页登录（`source=device`，只有 token，靠 refresh token 存活）和令牌导入（`source=token`）在控制台上以标签区分。
+
+### 防封控与代理池
+
+注册按**出口 IP** 被风控计数，池子让每个号从不同地址出去：
+
+- **代理池**：控制台「号池」→「代理池」，每行一个地址（`socks5://` `socks5h://` `http://` `https://`），「检测全部」拨号回填出口 IP / 归属 / 延迟。
+- **地址上限**：`signup.per_ip_limit`（默认 3）。地址达上限的代理被跳过；**代理全不可用时拒绝注册**，绝不静默走本机 IP。
+- **轮换策略**：`signup.proxy_strategy` = `rotate` / `random` / `single`。
+- **批量节流**：`signup.batch_max` 限制单批数量，`signup.gap_seconds` 给账号之间留间隔（串行注册，避免瞬时爆发特征）。
+- 同一次注册的邮箱调用与账号调用**共用同一代理**，出口地址可归因。
 
 ### 2. 调用
 
@@ -167,8 +224,36 @@ curl http://127.0.0.1:4555/v1/messages \
 --host HOST        监听地址（默认 127.0.0.1）
 --port PORT        监听端口（默认 4555，可用环境变量 PORT 覆盖）
 --data-dir DIR     SQLite 与生成媒体的存放目录（默认 ./data）
+--env-file FILE    启动时读取的 dotenv 文件（默认 .env）
 --reload           开发模式（代码热重载）
 ```
+
+## 配置：环境变量优先
+
+控制台能改的每一项设置都存在 SQLite 里，适合运行时调整（调度策略、冷却时间）。但**密钥**和**部署参数**不该放在数据库里——前者会明文落库并被 `/admin/api/settings` 回显，后者属于进程所处环境而非某一行数据。
+
+因此：**环境变量始终优先，并覆盖数据库里的值**。
+
+- 命名：`MINIMAX2API_<SECTION>__<FIELD>`（段与字段之间是**双下划线**，因为字段名里全是单下划线，如 `mail_pass`）。
+- 启动时读 `.env`（可用 `--env-file` 换路径）；**真实环境变量优先于文件**，所以临时覆盖不必改文件。
+- 被环境变量控制的项在控制台**只读**并标 `env`——改它不会生效，避免"改了没反应"被当成 bug。
+- 启动日志会打印 `[config] environment overrides: ...`，说明哪些被环境钉住。
+
+```bash
+cp .env.example .env   # 模板，逐项有注释
+```
+
+`HOST` / `PORT` / `DATA_DIR` 也接受带前缀的写法（`MINIMAX2API_PORT` 等），裸写法仍然有效。
+
+### 密钥脱敏
+
+控制台与 `/admin/api/settings` 对以下**密钥字段**只回传占位符 `********`，不返回明文：
+
+- `signup.mail_pass`（临时邮箱服务 Admin Passkey）
+- `signup.password`（新账号初始密码）
+- `upstream.proxy`（代理 URL，可能内嵌用户名密码）
+
+控制台的密钥输入框默认是密码态，旁边「显示」按钮可切换明文；保存时若原样回传占位符，服务端会当作"未修改"，不会把真实密钥覆盖成 `********`。要清除某项密钥，发送空字符串。
 
 ## 账号池
 
@@ -237,7 +322,7 @@ curl http://127.0.0.1:4555/v1/messages \
 python -m pytest tests/
 ```
 
-覆盖签名配方、prompt 整形、账号池状态机、凭据类型分派（查询参数 vs Bearer）、媒体路径安全。
+覆盖签名配方、prompt 整形、账号池状态机、凭据类型分派（查询参数 vs Bearer）、媒体路径安全、代理池解析/选择、环境变量覆盖与密钥脱敏。
 
 ## 二开：自行添加鉴权
 

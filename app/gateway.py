@@ -355,33 +355,56 @@ class Gateway:
             trace.account_name = lease.name
             credential = upstream.credential_of(lease.account)
             started = time.monotonic()
+            released = False
             try:
-                result = await self._client.completion(credential, options)
-            except upstream.AgentIDUnknown as err:
-                # Nothing is wrong with the account's health, it simply has no
-                # agent id yet.  No cooldown: that is for accounts being rate
-                # limited, and this one is not.
-                await self._pool.release(lease, success=False, error=None)
-                tried.add(lease.account.id)
-                last = err
-                continue
-            except upstream.InvalidCredential as err:
-                await self._pool.release(lease, success=False, error=err)
-                raise
-            except upstream.UpstreamError as err:
-                await self._pool.release(lease, success=False, error=err)
-                tried.add(lease.account.id)
-                last = err
-                continue
-            except Exception as err:  # noqa: BLE001 - no upstream failure may escape
-                await self._pool.release(lease, success=False, error=err)
-                tried.add(lease.account.id)
-                last = err
-                continue
+                try:
+                    result = await self._client.completion(credential, options)
+                except upstream.AgentIDUnknown as err:
+                    # Nothing is wrong with the account's health, it simply has
+                    # no agent id yet.  No cooldown: that is for accounts being
+                    # rate limited, and this one is not.
+                    await self._pool.release(lease, success=False, error=None)
+                    released = True
+                    tried.add(lease.account.id)
+                    last = err
+                    continue
+                except upstream.InvalidCredential as err:
+                    await self._pool.release(lease, success=False, error=err)
+                    released = True
+                    raise
+                except upstream.UpstreamError as err:
+                    await self._pool.release(lease, success=False, error=err)
+                    released = True
+                    tried.add(lease.account.id)
+                    last = err
+                    continue
+                except Exception as err:  # noqa: BLE001 - no upstream failure may escape
+                    await self._pool.release(lease, success=False, error=err)
+                    released = True
+                    tried.add(lease.account.id)
+                    last = err
+                    continue
 
-            await self._pool.release(lease, success=True)
-            trace.latency_ms = int((time.monotonic() - started) * 1000)
-            return result
+                await self._pool.release(lease, success=True)
+                released = True
+                trace.latency_ms = int((time.monotonic() - started) * 1000)
+                return result
+            finally:
+                # A cancelled request must not keep its account out of the pool.
+                # ``CancelledError`` is a BaseException, so none of the handlers
+                # above catch it and the lease would otherwise be leaked with its
+                # ``inflight`` count permanently incremented — which pins the
+                # account at ``max_concurrent`` for the life of the process.
+                # ``error=None`` gives the account back without recording a
+                # failure: a client hanging up says nothing about the credential.
+                if not released:
+                    # Shielded: while the task is unwinding from a cancellation,
+                    # any new ``await`` here would be cancelled too and the
+                    # account would stay pinned.  The release is cheap and must
+                    # still happen.
+                    await asyncio.shield(
+                        self._pool.release(lease, success=False, error=None)
+                    )
 
         assert last is not None
         raise last
