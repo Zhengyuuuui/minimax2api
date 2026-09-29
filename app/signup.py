@@ -190,7 +190,9 @@ class SignupService:
 
     # ------------------------------------------------------------------ public
 
-    async def start(self, name: str = "", region: str = "", count: int = 1) -> dict[str, Any]:
+    async def start(
+        self, name: str = "", region: str = "", count: int = 1, password: str = ""
+    ) -> dict[str, Any]:
         settings = self._settings_fn().signup
         if not settings.enabled:
             raise _fail(400, "headless registration is disabled")
@@ -212,6 +214,9 @@ class SignupService:
             name=name.strip(),
             count=count,
             settings=settings,
+            # Per-run override of the account password.  Blank means "use the
+            # configured default", which may itself be blank (no password at all).
+            password=password.strip(),
         )
         self._sessions[session.id] = session
         session.task = asyncio.create_task(self._run(session), name="minimaxcode2api-signup")
@@ -256,11 +261,20 @@ class SignupService:
         try:
             for index in range(session.count):
                 session.index = index + 1
-                proxy_entry = await self._pick_proxy(session)
-                if session.settings.use_proxies and proxy_entry is None:
+                proxy_entry, exhausted = await self._pick_proxy(session)
+                if exhausted:
+                    # A pool exists and every entry is at its address budget: that
+                    # is the one case where registering would mean reusing a burnt
+                    # exit address, so the batch stops rather than skipping it.
                     session.error = "no usable proxy with address budget left"
                     break
-                proxy_url = proxy_entry.url if proxy_entry else ""
+                # No pool (or no budget needed): fall back to the machine's own
+                # egress, which is the operator's configured proxy when there is
+                # one and a direct connection when there is not.
+                if proxy_entry is not None:
+                    proxy_url = proxy_entry.url
+                else:
+                    proxy_url = (self._settings_fn().upstream.proxy or "").strip()
                 session.proxy = proxy_url
                 session.step = "starting"
                 try:
@@ -271,6 +285,7 @@ class SignupService:
                         on_step=session.note,
                         proxy_url=proxy_url,
                         import_token=self._admin.import_device_token,
+                        password=session.password,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -329,34 +344,40 @@ class SignupService:
         except Exception as err:  # noqa: BLE001 - the account is already usable
             _log(f"[signup] check-in failed for {account_id}: {_clip(str(err))}")
 
-    async def _pick_proxy(self, session: "SignupSession") -> Any:
+    async def _pick_proxy(self, session: "SignupSession") -> tuple[Any, bool]:
         """Choose a proxy whose exit address is still under the limit.
+
+        Returns ``(entry, exhausted)``.  ``entry`` is ``None`` when there is no
+        proxy pool to use at all — the caller then falls back to the machine's own
+        egress (``upstream.proxy`` or direct) rather than refusing to register.
+        ``exhausted`` is True only when a pool *exists* but every entry is at its
+        address budget, which is the one case that is a real refusal.
 
         The limit is checked against the *counted* address, which is only known
         after a check; an entry that has never been checked has no counted address
         and is therefore allowed — its first use is how it gets one.
         """
-        if not session.settings.use_proxies:
-            return None
-        if self._db is None:
-            return None
+        if not session.settings.use_proxies or self._db is None:
+            return None, False
         proxies = await self._db.list_proxies()
         usable = [p for p in proxies if p.enabled and p.status != proxy.PROXY_BAD]
         if not usable:
-            return None
+            # An empty pool is not an error: the operator simply has not added
+            # proxies, and registration falls back to the machine's own egress.
+            return None, False
         # Rotate through usable entries, skipping any whose address is full.
         for _ in range(len(usable)):
             candidate = self._selector.pick(usable)
             if candidate is None:
-                return None
+                return None, True
             if not candidate.exit_ip:
-                return candidate
+                return candidate, False
             used = await self._db.ip_usage(candidate.exit_ip)
             if used < session.settings.per_ip_limit:
-                return candidate
+                return candidate, False
             # Full: drop it from this round's candidates and try the next.
             usable = [p for p in usable if p.id != candidate.id]
-        return None
+        return None, True
 
     async def _record_success(self, session: "SignupSession", account: dict[str, Any], proxy_entry: Any) -> None:
         account_name = str(account.get("name") or account.get("id") or "")
@@ -405,6 +426,8 @@ class SignupSession:
     settings: SignupSettings
     name: str = ""
     count: int = 1
+    # A per-run password override; empty means "use the configured default".
+    password: str = ""
     email: str = ""
     status: str = PENDING
     step: str = "starting"
@@ -450,6 +473,7 @@ async def register_account(
     on_step: Callable[[str], None] | None = None,
     proxy_url: str = "",
     import_token: Callable[..., Any] | None = None,
+    password: str = "",
 ) -> dict[str, Any]:
     """Create one account and import it; return the imported account view.
 
@@ -473,7 +497,7 @@ async def register_account(
 
     async with httpx.AsyncClient(**kwargs) as account_client:
         return await _register_with(
-            account_client, account_origin, settings, region, name, step, import_token
+            account_client, account_origin, settings, region, name, step, import_token, password
         )
 
 
@@ -485,6 +509,7 @@ async def _register_with(
     name: str,
     step: Callable[[str], None],
     import_token: Callable[..., Any] | None,
+    password: str = "",
 ) -> dict[str, Any]:
     from .security import random_device_id, random_uuid
 
@@ -524,13 +549,15 @@ async def _register_with(
     # and it is more useful in the pool without a password than discarded.  The
     # password is then reported as empty rather than as the configured value.
     password_set = ""
-    if settings.password:
+    chosen_password = password or settings.password
+    if chosen_password:
         step("setting password")
         try:
             await _set_password(
-                client, account_origin, session, settings, email, used_codes={code}
+                client, account_origin, session, settings, email,
+                used_codes={code}, password=chosen_password,
             )
-            password_set = settings.password
+            password_set = chosen_password
         except Exception as err:  # noqa: BLE001 - the account is already usable
             _log(f"[signup] password step failed, account kept without one: {_clip(str(err))}")
 
@@ -631,6 +658,7 @@ async def _set_password(
     email: str,
     *,
     used_codes: set[str] | None = None,
+    password: str = "",
 ) -> None:
     """Give a freshly registered account a password.
 
@@ -658,7 +686,8 @@ async def _set_password(
         label="password", used=used_codes,
     )
     await _set_password_with_code(
-        client, account_origin, session, settings, email, code
+        client, account_origin, session, settings, email, code,
+        password=password or settings.password,
     )
 
 
@@ -669,6 +698,8 @@ async def _set_password_with_code(
     settings: SignupSettings,
     email: str,
     code: str,
+    *,
+    password: str = "",
 ) -> None:
     """Apply the password, given the emailed code that authorises it.
 
@@ -676,12 +707,13 @@ async def _set_password_with_code(
     the backfill script, which must not look like a machine — can obtain the code
     itself and submit it a beat later, instead of the two happening back to back.
     """
+    chosen = password or settings.password
     _status, payload = await _signed(
         client, account_origin, session, "/oauth2/login",
         {
             "loginType": LOGIN_TYPE_PASSWORD,
             "email": email,
-            "authToken": rsa_encrypt(settings.password),
+            "authToken": rsa_encrypt(chosen),
             "code": code,
             "deviceID": session.device_id,
         },
@@ -911,6 +943,20 @@ async def _mail_create(
     payload = _json_or_text(response)
     if not isinstance(payload, dict):
         raise _fail(502, f"mail service error: {_clip(str(payload))}")
+    # The worker answers a bad admin passkey with this code.  Surfaced by name so
+    # an operator is told to re-enter the passkey instead of chasing a network or
+    # domain problem: the two look identical in a raw "register failed" message,
+    # and only one of them is fixed in Settings.
+    code = str(payload.get("code") or "")
+    if code == "AUTH_ADMIN_CREDENTIAL_INVALID" or (
+        response.status_code in (401, 403) and "ADMIN" in code.upper()
+    ):
+        raise _fail(
+            502,
+            "邮箱服务拒绝了管理密钥（AUTH_ADMIN_CREDENTIAL_INVALID）："
+            "请在「设置」或「号池 → 邮箱配置」重新填写 mail_pass，"
+            "确认与邮箱 worker 的 admin 密码一致",
+        )
     return payload
 
 

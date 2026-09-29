@@ -4,6 +4,13 @@
 
 ## 📝 更新日志
 
+### 本次更新（注册 · 密码 · 邮箱限流）
+
+- **无头注册支持邮箱密码**：默认给新账号设密码 `Minimax2026!`（`signup.password`），注册面板新增“初始密码”输入框，填了则覆盖默认值，留空则用默认；默认留空且面板留空时不设密码。
+- **未配代理池不再报错**：代理池为空时注册回退到本机出口（`upstream.proxy`，未填则直连），只有“池内代理全部超地址预算”才拒绝，修复了此前误报 `no usable proxy with address budget left`。
+- **邮箱 admin passkey 不再被误解**：邮箱配置面板不再把掩码 `********` 回填成“已填”的假值（改为留空 + “已设置，留空则不变”）；worker 拒绝密钥时抛出明确中文提示（`AUTH_ADMIN_CREDENTIAL_INVALID`）；缺失/占位符密码导致注册失败的问题一并修复。
+- **注册“卡在 setting password”说明**：设密码需第二封验证码，发码被限流（code 32）时程序会等待重试。README 新增“排错：注册卡在 setting password / code 32”一节，给出换出口、放慢批量、跳过密码等解决方案。
+
 ### 本次更新（账号池健康 · 保活 · 额度 · 签到）
 
 - **取消请求泄漏修复**：流式请求被客户端中断时，`CancelledError` 会绕过 `pool.release`，导致账号的 `inflight` 永久 +1。单账号 `max_concurrent=1` 时整个号池被钉死，之后所有 chat 卡住且无日志。现在 `gateway._run` 用 `try/finally` 保证租约必定归还。
@@ -127,15 +134,18 @@ python run.py --port 4555
 
 **方式 C：无头注册（自动造号入池）**
 
-控制台「号池」→「无头注册」→ 选区域 / 数量 →「开始注册」。全程无浏览器：
+控制台「号池」→「无头注册」→ 选区域 / 数量 /（可选）初始密码 →「开始注册」。全程无浏览器：
 
 1. 向临时邮箱服务要一个地址（`signup.mail_base` / `mail_domain` / `mail_pass`）；
 2. `POST /v1/api/user/login/sms/send` 取邮箱验证码；
 3. `POST /oauth2/login`（`loginType=21`）验证即注册，拿到 `_sid` 会话；
-4. 服务端用该会话走**设备码流程**（`/oauth2/device/code` → `GET/POST /oauth2/device/authorize` → `/oauth2/token`）换出 OAuth `access_token`；
-5. 交给现有 `import_device_token` 入池——与浏览器一键登录产出同一种账号。
+4. **设置密码**：默认使用 `signup.password`（默认 `Minimax2026!`），注册面板填了则以面板为准。这一步需要**第二封邮件验证码**（注册那封已被消耗），通常比前面慢；
+5. 服务端用该会话走**设备码流程**（`/oauth2/device/code` → `GET/POST /oauth2/device/authorize` → `/oauth2/token`）换出 OAuth `access_token` + `refresh_token`；
+6. 交给现有 `import_device_token` 入池，并**自动签到一次**领取首日额度。
 
 > 该 build 的腾讯验证码被编译关闭（`h.Xy=false`），故发码无需验证码；`cn` 区 build 会拉起验证码，是另一条路。
+
+> **密码步骤可跳过**：把 `signup.password` 设为空、且注册面板留空，则不设密码；账号仍有 refresh_token 可续期，但没有密码就无法在控制台用密码重登。
 
 **方式 D：邮箱密码批量导入**
 
@@ -153,6 +163,20 @@ python run.py --port 4555
 - **轮换策略**：`signup.proxy_strategy` = `rotate` / `random` / `single`。
 - **批量节流**：`signup.batch_max` 限制单批数量，`signup.gap_seconds` 给账号之间留间隔（串行注册，避免瞬时爆发特征）。
 - 同一次注册的邮箱调用与账号调用**共用同一代理**，出口地址可归因。
+
+### 排错：注册卡在 “setting password”，或提示 code 32 / 邮箱错误
+
+**现象**：控制台注册长时间停在 `setting password`（可达 2–3 分钟）。
+
+**原因**：设置密码需要**第二封邮箱验证码**，而账号服务的发码接口按地址限流。被限流时返回 `code 32`，此时邮件往往**已经发出**，程序会继续等待并重试（最多 3 次、每次间隔 20 秒，总时长受 `signup.mail_timeout_sec` 约束）。所以“卡住”多半是在等邮件，不是死锁——也可能最终成功。
+
+**怎么解决/缓解**：
+1. **换出口地址**：限流是**按 IP** 的。配上**代理池**（`use_proxies=true` + 多个代理），每个号走不同出口，可显著降低同一地址的发码频率。单个地址注册太密必然触发。
+2. **放慢批量**：调大 `signup.gap_seconds`（账号间隔），降低 `signup.batch_max`（单批数量），不要短时间内连造。
+3. **拉长等待**：网络/邮件服务慢时把 `signup.mail_timeout_sec` 调大（最小 10），并确认 `mail_poll_sec` 不太大。
+4. **确认邮箱服务本身可用**：`mail_base` / `mail_domain` / `mail_pass` 三项要匹配你的临时邮箱 worker；passkey 错误会返回 `AUTH_ADMIN_CREDENTIAL_INVALID`（现在会给出明确中文提示）。可用“全部探测/余额”之外的方式先验证 worker 能建地址。
+5. **不需要密码就跳过**：若只是要能用的号（有 refresh_token 即可续期），把 `signup.password` 留空、注册面板也留空，即跳过整个设密码步骤，注册会快很多。
+6. **代理与本机出口**：国际站业务接口锁海外出口。没配代理池时注册走 `upstream.proxy`（未填则直连）；直连且本机在国内会失败或极易被风控。
 
 ### 2. 调用
 

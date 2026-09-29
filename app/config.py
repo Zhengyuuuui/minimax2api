@@ -185,7 +185,11 @@ class SignupSettings:
     mail_timeout_sec: int = 120
     mail_poll_sec: int = 3
     # Set a password on the fresh account so a future re-login needs no mailbox.
-    password: str = ""
+    # This is the default for every registration; an operator who wants a different
+    # one types it in the registration panel (which overrides this for that run) or
+    # changes this setting.  Overridable from the environment as
+    # ``MINIMAX2API_SIGNUP__PASSWORD``.
+    password: str = "Minimax2026!"
     # OAuth grant the registration is authorised against, then imported.
     oauth_scope: str = "agent.default"
     oauth_audience: str = "agent-backend"

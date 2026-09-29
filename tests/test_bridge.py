@@ -875,8 +875,63 @@ def test_signup_picks_around_a_full_address():
     service = signup.SignupService(None, None, lambda: _signup_holder(settings), db)
 
     session = signup.SignupSession(id="s", region="global", settings=settings)
-    picked = asyncio.run(service._pick_proxy(session))
+    picked, exhausted = asyncio.run(service._pick_proxy(session))
     assert picked is not None and picked.id == fresh.id
+    assert exhausted is False
+
+
+def test_signup_without_a_pool_falls_back_to_the_machine_egress():
+    """An empty proxy pool is not a failure — it means "no pool configured".
+
+    Registration then leaves by ``upstream.proxy`` when one is set and directly
+    when it is not, instead of refusing the whole batch with "no usable proxy".
+    """
+    from app import signup
+    from app.config import SignupSettings
+
+    class _Settings:
+        class upstream:  # noqa: N801 - mirror the settings shape
+            proxy = "http://127.0.0.1:7890"
+
+    class _Holder:
+        signup = SignupSettings(use_proxies=True)
+        upstream = _Settings.upstream
+
+    class _EmptyProxyDB:
+        async def list_proxies(self):
+            return []
+
+    service = signup.SignupService(None, None, lambda: _Holder(), _EmptyProxyDB())
+    session = signup.SignupSession(id="s", region="global", settings=_Holder.signup)
+    picked, exhausted = asyncio.run(service._pick_proxy(session))
+    assert picked is None
+    assert exhausted is False  # empty pool must not abort the batch
+
+
+def test_signup_start_carries_a_per_run_password():
+    """A password typed at the registration panel is used for those accounts.
+
+    It overrides the configured default for this run only, and a blank panel
+    leaves the default in place (which may be blank — no password at all).
+    """
+    from app import signup
+    from app.config import SignupSettings
+
+    class _Holder:
+        signup = SignupSettings(enabled=True, mail_pass="x", batch_max=5)
+
+    service = signup.SignupService(None, None, lambda: _Holder(), None)
+
+    async def scenario():
+        session = await service.start("n", "global", 1, "MyPass9!")
+        return service.get(session["id"])
+
+    public = asyncio.run(scenario())
+    assert public["status"] == signup.PENDING
+    # The stored session carries the override, which _run hands to register_account.
+    internal = list(service._sessions.values())[0]
+    assert internal.password == "MyPass9!"
+    asyncio.run(service.cancel(public["id"]))
 
 
 def _signup_holder(signup_settings):
@@ -1168,7 +1223,8 @@ def test_secrets_are_masked_and_flagged():
     assert view["signup"]["mail_pass"] == config.SECRET_MASK
     assert view["upstream"]["proxy"] == config.SECRET_MASK
     assert view["signup"]["mail_base"] == settings.signup.mail_base  # not a secret
-    assert set(view["_secrets"]) == {"signup.mail_pass", "upstream.proxy"}
+    # ``signup.password`` defaults to a non-empty value, so it is masked too.
+    assert set(view["_secrets"]) == {"signup.mail_pass", "signup.password", "upstream.proxy"}
     assert view["_locked"] == ["signup.mail_pass"]
 
 

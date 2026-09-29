@@ -267,12 +267,15 @@ def _register(app: FastAPI, state: AppState) -> None:
         body = await json_body(request)
         name = body.get("name") if isinstance(body, dict) else ""
         region = body.get("region") if isinstance(body, dict) else ""
+        password = body.get("password") if isinstance(body, dict) else ""
         count = body.get("count") if isinstance(body, dict) else 1
         try:
             count = int(count)
         except (TypeError, ValueError):
             count = 1
-        return await state.signup.start(str(name or ""), str(region or ""), count)
+        return await state.signup.start(
+            str(name or ""), str(region or ""), count, str(password or "")
+        )
 
     @app.get("/admin/api/signup/{session_id}")
     async def signup_status(session_id: str) -> Any:

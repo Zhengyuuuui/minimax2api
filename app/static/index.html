@@ -177,6 +177,7 @@
       <div class="row" style="margin-top:12px">
         <div><label>账号名称（可选）</label><input id="signup-name" placeholder="例如：批量号"></div>
         <div><label>数量</label><input id="signup-count" type="number" min="1" max="20" value="1" style="width:80px"></div>
+        <div><label>初始密码（可选）</label><input id="signup-password" type="text" placeholder="留空则用默认密码"></div>
         <div style="flex:0 0 auto"><label>&nbsp;</label><button id="signup-start">开始注册</button></div>
         <div style="flex:0 0 auto"><label>&nbsp;</label><button id="signup-cancel" class="ghost" hidden>取消</button></div>
       </div>
@@ -888,8 +889,16 @@ async function loadSignupMail() {
     const settings = await api("/admin/api/settings");
     $("#signup-mail-base").value = settings.signup.mail_base || "";
     $("#signup-mail-domain").value = settings.signup.mail_domain || "";
+    // The server answers a secret as the mask, never the value.  Putting the mask
+    // in the box is what makes an operator believe a real passkey is loaded when
+    // it is a placeholder; leaving it blank with a hint means "leave unchanged"
+    // is the honest state, and typing replaces it.
     const pass = settings.signup.mail_pass || "";
-    $("#signup-mail-pass").value = pass;
+    const passInput = $("#signup-mail-pass");
+    const masked = (settings._secrets || []).includes("signup.mail_pass");
+    passInput.value = "";
+    passInput.placeholder = pass ? "已设置，留空则不变" : "管理密钥";
+    passInput.dataset.masked = masked ? "1" : "";
     const locked = new Set(settings._locked || []);
     for (const [id, key] of [["signup-mail-base", "signup.mail_base"], ["signup-mail-domain", "signup.mail_domain"], ["signup-mail-pass", "signup.mail_pass"]]) {
       const input = $("#" + id);
@@ -903,16 +912,15 @@ async function loadSignupMail() {
 
 $("#signup-mail-save").addEventListener("click", async () => {
   try {
-    await api("/admin/api/settings", {
-      method: "POST",
-      body: JSON.stringify({
-        signup: {
-          mail_base: $("#signup-mail-base").value.trim(),
-          mail_domain: $("#signup-mail-domain").value.trim(),
-          mail_pass: $("#signup-mail-pass").value,
-        },
-      }),
-    });
+    const payload = {
+      mail_base: $("#signup-mail-base").value.trim(),
+      mail_domain: $("#signup-mail-domain").value.trim(),
+    };
+    // Only send the passkey when the operator actually typed one: an empty box
+    // means "keep the stored value", so sending "" would clear it.
+    const pass = $("#signup-mail-pass").value;
+    if (pass) payload.mail_pass = pass;
+    await api("/admin/api/settings", { method: "POST", body: JSON.stringify({ signup: payload }) });
     flash("邮箱配置已保存");
     await loadSignupMail();
   } catch (err) {
@@ -935,6 +943,7 @@ $("#signup-start").addEventListener("click", async () => {
         name: $("#signup-name").value.trim(),
         region: "global",
         count: parseInt($("#signup-count").value, 10) || 1,
+        password: $("#signup-password").value,
       }),
     });
     signupId = session.id;
