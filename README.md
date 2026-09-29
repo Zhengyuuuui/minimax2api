@@ -4,6 +4,12 @@
 
 ## 📝 更新日志
 
+### 本次更新（模型选择 · 上新 M3.1 Flash）
+
+- **接入真实模型选择**：`ModelConfig.upstream_model` / `variant` 现在会转换为上游的 `model` 选择对象 `{"model_id", "provider_id": "minimax", "variant"}`（此前从未发送，所有请求都用账号默认模型）。上游拒绝裸字符串，必须是对象。
+- **新增模型**：`minimax-m3.1-flash`、`minimax-m3.1-flash-thinking`（上游 `MiniMax-M3.1-Flash-Preview`，512K / 可选 1M）；修正 `minimax-m3-thinking` 使用 `MiniMax-M3` + `variant=thinking`。
+- **实时读取上游模型**：`GET /minimax-cloud/api/v1/config` 返回当前可用模型清单。
+
 ### 本次更新（注册 · 密码 · 邮箱限流）
 
 - **无头注册支持邮箱密码**：默认给新账号设密码 `Minimax2026!`（`signup.password`），注册面板新增“初始密码”输入框，填了则覆盖默认值，留空则用默认；默认留空且面板留空时不设密码。
@@ -196,14 +202,19 @@ curl http://127.0.0.1:4555/v1/chat/completions \
 
 | 模型 ID | 显示名 | 类型 | 说明 |
 |---|---|---|---|
-| `minimax-agent` | MiniMax Agent | chat | 通用 Agent，自动规划并调用工具 |
+| `minimax-agent` | MiniMax Agent | chat | 通用 Agent，自动规划并调用工具（不发 model，用账号默认） |
+| `minimax-m3.1-flash` | MiniMax M3.1 Flash Preview | chat | 新一代 Flash 预览版，512K / 可选 1M 上下文 |
+| `minimax-m3.1-flash-thinking` | MiniMax M3.1 Flash Preview Thinking | chat | M3.1 Flash 预览版的深度思考变体 |
 | `minimax-m3` | MiniMax M3 | chat | 对话模式，响应更快 |
-| `minimax-m3-thinking` | MiniMax M3 Thinking | chat | 深度思考，推理内容走 `reasoning_content` |
+| `minimax-m3-thinking` | MiniMax M3 Thinking | chat | 深度思考变体 |
 | `minimax-m2.7` | MiniMax M2.7 | chat | 上一代对话模型 |
 | `minimax-m2.7-highspeed` | MiniMax M2.7 HighSpeed | chat | 上一代高速版 |
 | `minimax-image` | MiniMax Image | image | 图像生成，图片以 Markdown 返回 |
 
-> 所有 chat 模型到达的是同一个上游 agent；模型条目仅决定 `upstream_model` 字段的取值。
+> 所有 chat 模型到达的是同一个上游 agent；模型条目决定发送的 `model` 选择对象
+> `{"model_id": <upstream_model>, "provider_id": "minimax", "variant": "thinking"|""}`。
+> 上游的模型清单可实时读取：`GET /minimax-cloud/api/v1/config` 的 `models` 字段
+> （当前含 `MiniMax-M3.1-Flash-Preview`、`MiniMax-M3`、`MiniMax-M2.7`、`MiniMax-M2.7-highspeed`）。
 
 ## API 接口
 

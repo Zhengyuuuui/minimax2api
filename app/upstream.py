@@ -178,6 +178,10 @@ class Options:
     text: str = ""
     mode: str = ""
     client_intent: str = ""
+    # The model the turn asks for, as ``{"model_id", "provider_id", "variant"}``.
+    # Empty means "let the upstream pick its default", which is what every build
+    # before the selector shape was known did.  See ``ModelConfig.upstream_model``.
+    model: dict[str, Any] = field(default_factory=dict)
     images: list[UploadedImage] = field(default_factory=list)
     timeout: float = 0.0
     idle_timeout: float = 0.0
@@ -1261,14 +1265,25 @@ class MiniMaxClient:
                 {"type": "image", "url": image.url, "name": image.name}
                 for image in options.images
             ]
-        template = (settings.upstream.model_payload or "").strip()
-        if template:
-            try:
-                parsed = json.loads(template)
-            except ValueError:
-                parsed = None
-            if isinstance(parsed, dict):
-                body["model"] = parsed
+        # The model selection: an explicit ``model`` from the caller wins; the
+        # operator's template is the fallback for older setups.  The upstream
+        # rejects a bare string and a bare ``model_id``, so a template that is not
+        # a dict is ignored rather than sent to fail.
+        selection: dict[str, Any] | None = None
+        if options.model:
+            selection = dict(options.model)
+        else:
+            template = (settings.upstream.model_payload or "").strip()
+            if template:
+                try:
+                    parsed = json.loads(template)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    selection = parsed
+        if selection:
+            selection.setdefault("provider_id", "minimax")
+            body["model"] = selection
         if options.mode:
             body["mode"] = options.mode
         intent = (options.client_intent or "").strip()

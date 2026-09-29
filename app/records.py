@@ -544,6 +544,9 @@ class ModelConfig:
     name: str = ""
     upstream: str = "agent"
     upstream_model: str = ""
+    # The upstream variant: "" for the plain model, "thinking" for its reasoning
+    # variant.  Sent alongside ``upstream_model`` in the model selection object.
+    variant: str = ""
     type: str = MODEL_CHAT
     enabled: bool = True
     builtin: bool = False
@@ -557,6 +560,7 @@ class ModelConfig:
             "name": self.name,
             "upstream": self.upstream,
             "upstreamModel": self.upstream_model,
+            "variant": self.variant,
             "type": self.type,
             "enabled": self.enabled,
             "builtin": self.builtin,
@@ -567,11 +571,13 @@ class ModelConfig:
 
     @classmethod
     def from_row(cls, row: Any) -> "ModelConfig":
+        keys = row.keys()
         return cls(
             id=row["id"],
             name=row["name"],
             upstream=row["upstream"],
             upstream_model=row["upstream_model"] or "",
+            variant=(row["variant"] or "") if "variant" in keys else "",
             type=row["type"],
             enabled=bool(row["enabled"]),
             builtin=bool(row["builtin"]),
@@ -614,10 +620,33 @@ def builtin_models() -> list[ModelConfig]:
             id="minimax-m3-thinking",
             name="MiniMax M3 Thinking",
             upstream="think",
+            upstream_model="MiniMax-M3",
+            variant="thinking",
             type=MODEL_CHAT,
             enabled=True,
             builtin=True,
             description="深度思考模式，推理内容走 reasoning_content",
+        ),
+        ModelConfig(
+            id="minimax-m3.1-flash",
+            name="MiniMax M3.1 Flash Preview",
+            upstream="chat",
+            upstream_model="MiniMax-M3.1-Flash-Preview",
+            type=MODEL_CHAT,
+            enabled=True,
+            builtin=True,
+            description="新一代 Flash 预览版，512K/1M 上下文，响应更快",
+        ),
+        ModelConfig(
+            id="minimax-m3.1-flash-thinking",
+            name="MiniMax M3.1 Flash Preview Thinking",
+            upstream="think",
+            upstream_model="MiniMax-M3.1-Flash-Preview",
+            variant="thinking",
+            type=MODEL_CHAT,
+            enabled=True,
+            builtin=True,
+            description="M3.1 Flash 预览版的深度思考模式",
         ),
         ModelConfig(
             id="minimax-m2.7",
@@ -669,10 +698,16 @@ def merge_builtin_models(models: list[ModelConfig]) -> bool:
         if not model.builtin:
             continue
         builtin = by_id.get(model.id)
-        if not builtin or not builtin.upstream_model or model.upstream_model:
+        if not builtin:
             continue
-        model.upstream_model = builtin.upstream_model
-        changed = True
+        if builtin.upstream_model and not model.upstream_model:
+            model.upstream_model = builtin.upstream_model
+            changed = True
+        # The variant follows the same rule: no console sets it, so an empty one
+        # is "not yet known", not an operator's choice of the plain model.
+        if builtin.variant and not model.variant:
+            model.variant = builtin.variant
+            changed = True
     for model in builtin_models():
         if model.id in known:
             continue

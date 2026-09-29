@@ -261,6 +261,21 @@ class Gateway:
 
     # ---------------------------------------------------------------- answering
 
+    def _model_selection(self, model: ModelConfig) -> dict[str, Any]:
+        """The upstream model selector for a catalogue entry.
+
+        The upstream takes an object — ``{model_id, provider_id, variant}`` — not
+        the id string, and rejects a bare string or a bare ``model_id``.  An entry
+        with no ``upstream_model`` (the agent default) sends nothing, which lets
+        the account's own default answer.
+        """
+        if not model.upstream_model:
+            return {}
+        selection: dict[str, Any] = {"model_id": model.upstream_model}
+        if model.variant:
+            selection["variant"] = model.variant
+        return selection
+
     async def _respond(
         self, request: Any, chat: ChatRequest, model: ModelConfig, trace: Trace, dialect: str
     ) -> Any:
@@ -270,6 +285,7 @@ class Gateway:
             text=prompt,
             timeout=float(self._settings_fn().upstream.request_timeout_sec),
             images=[upstream.UploadedImage(url=url) for url in chat.images],
+            model=self._model_selection(model),
         )
 
         if chat.stream:

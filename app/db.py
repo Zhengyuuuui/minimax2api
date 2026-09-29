@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS models (
     name           TEXT NOT NULL DEFAULT '',
     upstream       TEXT NOT NULL DEFAULT 'agent',
     upstream_model TEXT NOT NULL DEFAULT '',
+    variant        TEXT NOT NULL DEFAULT '',
     type           TEXT NOT NULL DEFAULT 'chat',
     enabled        INTEGER NOT NULL DEFAULT 1,
     builtin        INTEGER NOT NULL DEFAULT 0,
@@ -200,11 +201,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("token_expires_at", "REAL NOT NULL DEFAULT 0"),
             ("source", "TEXT NOT NULL DEFAULT 'token'"),
         ],
+        "models": [
+            ("variant", "TEXT NOT NULL DEFAULT ''"),
+        ],
     }
     for table, columns in additions.items():
         # Positional: callers differ on row_factory, and PRAGMA's name column is
-        # index 1 in every sqlite build.
+        # index 1 in every sqlite build.  An empty result means the table does not
+        # exist yet (it will be created by SCHEMA), so there is nothing to alter.
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue
         for name, ddl in columns:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
@@ -372,15 +379,17 @@ class Database:
         models = [ModelConfig.from_row(row) for row in conn.execute("SELECT * FROM models")]
         if merge_builtin_models(models):
             conn.executemany(
-                "INSERT INTO models (id, name, upstream, upstream_model, type, enabled, builtin,"
-                " description, requests, tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(id) DO UPDATE SET upstream_model = excluded.upstream_model",
+                "INSERT INTO models (id, name, upstream, upstream_model, variant, type, enabled, builtin,"
+                " description, requests, tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET upstream_model = excluded.upstream_model,"
+                " variant = excluded.variant",
                 [
                     (
                         model.id,
                         model.name,
                         model.upstream,
                         model.upstream_model,
+                        model.variant,
                         model.type,
                         int(model.enabled),
                         int(model.builtin),
