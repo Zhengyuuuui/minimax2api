@@ -147,29 +147,28 @@ def test_tool_and_unknown_roles_are_rendered_as_user_turns():
 
 
 def test_strip_prompt_echo_drops_the_replayed_request():
-    """Some agents replay the whole turn before answering.
+    """The agent replays the whole turn before answering.
 
-    The frame carries the flattened prompt the bridge just sent, so the reply
-    would otherwise contain the entire request — and the request is what makes
-    the token count explode after a model switch.
+    The stream's first content is the flattened prompt the bridge just sent, so
+    the reply would otherwise start with the entire request — and the request is
+    what makes the token count explode after a model switch.
     """
     from app import upstream
 
     echo = "[系统指令] You are opencode, an interactive CLI tool for coding.\n\n 用户：1. hi"
     frame = echo + "\nHi! 我是 minimax-m3.1-flash"
-    assert upstream._strip_prompt_echo(frame, echo) == "\nHi! 我是 minimax-m3.1-flash"
-    # Text before and after the echo both survive; only the echoed middle goes.
-    assert upstream._strip_prompt_echo("note|" + echo + "|tail", echo) == "note||tail"
+    assert upstream._strip_prompt_echo(frame, echo) == "Hi! 我是 minimax-m3.1-flash"
+    # A bare question is echoed too, and stripped the same way.
+    assert upstream._strip_prompt_echo("say hi in frenchBonjour !", "say hi in french") == "Bonjour !"
 
 
-def test_strip_prompt_echo_keeps_normal_answers_and_short_prompts():
+def test_strip_prompt_echo_keeps_a_real_answer_that_only_starts_alike():
     from app import upstream
 
-    long_prompt = "[系统指令] " + "x" * 80
-    # A reply that never contains the prompt is untouched.
-    assert upstream._strip_prompt_echo("你好！", long_prompt) == "你好！"
-    # A short prompt is not distinctive, so an echoing answer is left alone.
-    assert upstream._strip_prompt_echo("hi there!", "hi") == "hi there!"
+    # The prompt is not a prefix of the answer, so nothing is removed.
+    assert upstream._strip_prompt_echo("你好！有什么可以帮你的？", "hi") == "你好！有什么可以帮你的？"
+    # An empty prompt never strips anything.
+    assert upstream._strip_prompt_echo("just an answer", "") == "just an answer"
 
 
 def test_collapse_repeated_tail_only_folds_exact_doubling():
@@ -178,9 +177,19 @@ def test_collapse_repeated_tail_only_folds_exact_doubling():
     assert upstream._collapse_repeated_tail("Hi! 我是 minimax-m3.1-flash 👋Hi! 我是 minimax-m3.1-flash 👋") == (
         "Hi! 我是 minimax-m3.1-flash 👋"
     )
-    # A real answer that merely repeats a phrase is longer than the fold rule and survives.
+    # A real answer that merely repeats a phrase is not an exact doubling and survives.
     answer = "这是一个正常长度的回答，包含一些重复的词语，但整体不是整段复制。"
     assert upstream._collapse_repeated_tail(answer) == answer
+
+
+def test_echo_then_doubling_is_fully_removed():
+    """The two defects stack: echo prefix plus a doubled answer."""
+    from app import upstream
+
+    prompt = "say hi in french"
+    answer = "Bonjour ! Comment ça va ?"
+    raw = prompt + answer + answer
+    assert upstream._collapse_repeated_tail(upstream._strip_prompt_echo(raw, prompt)) == answer
 
 
 # ---------------------------------------------------------------------- media

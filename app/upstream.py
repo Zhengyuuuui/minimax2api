@@ -462,49 +462,57 @@ def _first_deep_string(payload: dict[str, Any], keys: Iterable[str]) -> str:
 
 
 def _strip_prompt_echo(text: str, prompt: str) -> str:
-    """Drop the request echoed back inside a content frame.
+    """Drop the request echoed at the front of the reply.
 
-    Some MiniMax agents replay the whole turn they were given before they
-    answer: one frame carries the ``content`` the bridge just sent, so the
-    flattened system prompt and history come back as if the model had written
-    them.  The reply then contains the entire request, which is both wrong and
-    enormous.
+    The MiniMax agent replays the turn it was given before it answers: the
+    stream's first ``content`` is the ``content`` the bridge just sent — the
+    flattened system prompt + history for a chat, or the bare question for a
+    single turn.  Concatenated onto the real answer it makes the reply look like
+    it starts with the entire request, which is both wrong and enormous.
 
-    The check is deliberately narrow, because a false positive would delete a
-    real answer: only a frame that actually carries the sent prompt is touched.
-    A frame that merely mentions it, or a prompt too short to be an echo (a bare
-    ``hi`` is also a plausible reply), is left alone.
+    The prompt is matched as a *leading prefix* (whitespace-insensitive), because
+    that is exactly where the echo lands; text after it is the real answer and is
+    kept.  A prompt whose leading run is also a plausible answer start (a bare
+    ``hi``) is still stripped only when the whole prompt is present as a prefix,
+    so an answer that merely begins with the same word is not mistaken for an
+    echo.
     """
     if not prompt or not text:
         return text
-    # A short prompt has no distinctive tail, so an echo cannot be told apart
-    # from a genuine answer and is not stripped.
     marker = prompt.strip()
-    if len(marker) < 32:
+    if not marker:
         return text
-    if marker not in text:
-        return text
-    # Everything up to and including the echo is the request, not the answer.
-    # ``head`` is any text before the echo and ``tail`` any text after it; both
-    # sides can be legitimately non-empty, so both are kept and only the echoed
-    # middle is dropped.
-    head, _, tail = text.partition(marker)
-    return head + tail
+    body = text.lstrip()
+    if not body.startswith(marker):
+        # The echo can also be re-wrapped without the leading whitespace the
+        # request carried; try the exact prefix before giving up.
+        if not text.startswith(marker):
+            return text
+        body = text
+    # Drop the separator whitespace the echo left between itself and the answer.
+    return body[len(marker):].lstrip("\n\r")
 
 
 def _collapse_repeated_tail(text: str) -> str:
     """Collapse an answer the upstream repeated back-to-back.
 
-    A streamed reply occasionally contains the same sentence twice ("Hi! ... Hi!
-    ...").  Only an exact, whole-string doubling of a reasonably long answer is
-    collapsed, so ordinary repetition inside a real answer survives.
+    The same turn is streamed twice, so the reply ends with its own first half
+    ("Hi! ... Hi! ...").  The split point is the middle of the text and the two
+    halves must match exactly, which keeps ordinary repetition inside a real
+    answer intact.
     """
     body = text.strip()
-    if len(body) < 16:
+    if len(body) < 4:
         return text
     half = len(body) // 2
     if len(body) % 2 == 0 and body[:half] == body[half:]:
         return body[:half]
+    # An odd-length reply can still be doubled around a one-character seam; a
+    # trailing sliver after the fold is common and worth dropping with it.
+    for shift in (0, 1):
+        half = (len(body) - shift) // 2
+        if half >= 2 and body[:half] == body[half : 2 * half]:
+            return body[:half]
     return text
 
 
