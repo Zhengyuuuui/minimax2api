@@ -4,6 +4,13 @@
 
 ## 📝 更新日志
 
+### 本次更新（真流式转发 · 修复“一直 wait response”）
+
+- **修复：流式请求长时间无任何输出，客户端超时后 502**。`gateway._stream` 此前是**伪流式**——先 `await self._run(...)` 等上游把整轮生成完，再一次性吐出所有帧。上游在轮次之间会保持连接，于是首字节延迟等于整个生成耗时；只发一句 `hi` 也要等上游完整返回，客户端（opencode / Grok CLI）等不到首字节便断开，审计记为 `502 Cancelled via cancel scope`、`latency_ms=0`。改用 `asyncio.Queue` 桥接：上游调用作为任务运行，逐 delta 入队，生成器边到边转发，**首字节延迟从数十秒降到毫秒级**。
+- **流式回显过滤**：真流式下无法等全文再剥回显，新增 `upstream.StreamingEchoFilter`——先缓存开头若干 delta，判定“回复是否以上游回显的 prompt 开头”，确认是回显则丢弃，否则整体放行；客户端不会短暂看到请求内容。流结束时 `flush` 兜底。
+- **流式重复回答抑制**：上游在轮末会把整段回答作为**单个 chunk 重发一次**，导致内容与 token 翻倍。`gateway._is_repeat_tail` 检测“该 chunk 是否以已发内容开头”，命中则丢弃。
+- 流式路径现在同样写入审计（`response_body`、`completion_tokens`）与用量统计。
+
 ### 本次更新（剥离上游回显·切换模型不再撑爆上下文）
 
 - **修复：切换模型后响应里出现整段 system prompt / skills，且 token 虚高**。部分 MiniMax Agent 上游会把本轮请求的 `content`（网关拍平的 system prompt + 历史）**原样回显**成一帧，`_handle_frame` 用 `CONTENT_KEYS`（含 `content`）把它当成回答收集。表现是只发一句 `hi`，回复里却带着几十万 token 的 `[系统指令] You are opencode... / <available_skills>...`，`completion_tokens` 虚高到 ~38 万，耗时数十秒。
@@ -342,6 +349,7 @@ cp .env.example .env   # 模板，逐项有注释
 
 - **架构**：FastAPI + httpx（异步）+ SQLite（标准库 `sqlite3`，经 `asyncio.to_thread` 调度）
 - **无状态转发**：一次请求建一个上游会话，不跨请求复用，避免不同调用方上下文串扰
+- **真流式**：流式请求经 `asyncio.Queue` 桥接上游 delta，边到边转发；先缓冲开头以剥离回显，轮末丢弃上游重发的整段重复
 - **媒体处理**：上游附件需其自有上传接口签名，无法复现，故带图请求仅传递 URL；生成图片下载至 `data/generated/` 并按 `/media/<id>` 提供
 - **审计**：请求体、响应体、账号、耗时、Token 估算均落库，可按模型/结果筛选，按保留策略自动清理
 - **设置热更新**：所有可调参数存于 SQLite 单 JSON 文档，修改即时生效，无需重启

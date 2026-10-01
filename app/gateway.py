@@ -22,6 +22,7 @@ tell "retry everything" from "this stream died".
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -328,30 +329,261 @@ class Gateway:
         options: upstream.Options,
         dialect: str,
     ) -> AsyncIterator[bytes]:
+        """Relay the upstream answer as it arrives.
+
+        The upstream holds the connection open between turns, so waiting for the
+        whole reply before writing the first byte makes a slow turn look like a
+        hang and lets a client that watches for first-byte latency time out.
+        The deltas are bridged through a queue instead: the upstream call runs as
+        a task and pushes chunks, and this generator forwards them as they land.
+
+        Output is incremental, so the prompt-echo filter has to work on a stream
+        (``StreamingEchoFilter``).  It holds the opening deltas until it can tell
+        whether the reply starts with the request, and only then releases them —
+        the client never sees the echo, only a slightly later first byte.
+        """
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        text_filter = upstream.StreamingEchoFilter(options.text)
+        think_filter = upstream.StreamingEchoFilter(options.text)
+
+        openai = dialect == "openai"
+        created = int(time.time())
+        response_id = "chatcmpl-" + new_id() if openai else "msg_" + new_id()
+        block_index = 0
+        thinking_open = False
+        text_open = False
+
+        def enqueue(kind: str, value: Any) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, (kind, value))
+
+        def on_delta(chunk: str) -> None:
+            safe = text_filter.feed(chunk)
+            if safe:
+                enqueue("text", safe)
+
+        def on_thinking(chunk: str) -> None:
+            safe = think_filter.feed(chunk)
+            if safe:
+                enqueue("thinking", safe)
+
+        options.on_delta = on_delta
+        options.on_thinking = on_thinking
+
+        async def run() -> None:
+            try:
+                result = await self._run(options, trace)
+                # The streamed answer is what the client received; the audit
+                # records the assembled text and its estimated size, matching
+                # the non-streaming path.
+                answer = result.text
+                trace.response_body = answer
+                trace.completion_tokens = estimate_tokens(answer) + (
+                    estimate_tokens(result.thinking) if result.thinking else 0
+                )
+                await self._db.record_model_usage(model.id, 1, trace.completion_tokens)
+                trace.finish(status=200)
+                await self._db.append_audit(trace.record())
+                enqueue("done", result)
+            except BaseException as err:  # noqa: BLE001 - anything left is reported here
+                trace.finish(status=502, error=err)
+                await self._db.append_audit(trace.record())
+                enqueue("error", err)
+            finally:
+                enqueue("end", None)
+
+        task = asyncio.create_task(run())
+
+        # Opening frames: OpenAI wants the role first; Anthropic wants a
+        # message_start and, if it ever appears, a thinking block ahead of text.
+        if openai:
+            yield _sse(
+                None,
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model.id,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                },
+            )
+        else:
+            yield _sse(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": response_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model.id,
+                        "content": [],
+                        "usage": {"input_tokens": trace.prompt_tokens, "output_tokens": 0},
+                    },
+                },
+            )
+
+        def delta_frame(kind: str, text: str) -> bytes:
+            nonlocal block_index, thinking_open, text_open
+            if openai:
+                key = "reasoning_content" if kind == "thinking" else "content"
+                return _sse(
+                    None,
+                    {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model.id,
+                        "choices": [{"index": 0, "delta": {key: text}, "finish_reason": None}],
+                    },
+                )
+            if kind == "thinking":
+                if not thinking_open:
+                    thinking_open = True
+                    head = _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        },
+                    )
+                else:
+                    head = b""
+                return head + _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "thinking_delta", "thinking": text},
+                    },
+                )
+            head = b""
+            if not text_open:
+                if thinking_open:
+                    head += _sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": block_index},
+                    )
+                    block_index += 1
+                text_open = True
+                head += _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                )
+            return head + _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            )
+
+        result: upstream.Result | None = None
+        error: BaseException | None = None
+        emitted = ""
         try:
-            result = await self._run(options, trace)
-            text = await self._finalize(result, trace, model)
-        except BaseException as err:  # noqa: BLE001 - anything left is reported here
-            trace.finish(status=502, error=err)
-            await self._db.append_audit(trace.record())
-            # The first byte has already gone out, so this can only ever be a
-            # frame: an HTTP status here would be ignored by a client that is
-            # already reading the body.
-            yield _error_frame(err, dialect)
+            while True:
+                kind, value = await queue.get()
+                if kind == "end":
+                    break
+                if kind == "error":
+                    error = value
+                    continue
+                if kind == "done":
+                    result = value
+                    # Anything the filters held back is part of the answer; emit
+                    # it now that the stream has ended.
+                    tail = text_filter.flush()
+                    if tail and not _is_repeat_tail(tail, emitted):
+                        emitted += tail
+                        yield delta_frame("text", tail)
+                    tail = think_filter.flush()
+                    if tail:
+                        yield delta_frame("thinking", tail)
+                    continue
+                if kind == "text":
+                    # The upstream re-sends the whole answer as one final chunk.
+                    # Forwarding it would double the reply and the token count.
+                    if _is_repeat_tail(value, emitted):
+                        continue
+                    emitted += value
+                yield delta_frame(kind, value)
+        finally:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+
+        if error is not None:
+            yield _error_frame(error, dialect)
             return
 
-        trace.finish(status=200)
-        await self._db.append_audit(trace.record())
-        render = _openai_stream if dialect == "openai" else _anthropic_stream
-        for frame in render(result, text, model.id, trace):
-            yield frame
+        # Close the stream in the client's dialect.
+        if openai:
+            yield _sse(
+                None,
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model.id,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": trace.prompt_tokens,
+                        "completion_tokens": trace.completion_tokens,
+                        "total_tokens": trace.prompt_tokens + trace.completion_tokens,
+                    },
+                },
+            )
+            yield b"data: [DONE]\n\n"
+        else:
+            if thinking_open:
+                yield _sse(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": block_index},
+                )
+                block_index += 1
+            if not text_open:
+                yield _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                )
+            yield _sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_index},
+            )
+            yield _sse(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": trace.completion_tokens},
+                },
+            )
+            yield _sse("message_stop", {"type": "message_stop"})
 
-    async def _run(self, options: upstream.Options, trace: Trace) -> upstream.Result:
+    async def _run(
+        self, options: upstream.Options, trace: Trace
+    ) -> upstream.Result:
         """The failover loop.
 
         Only failures that were the *account's* fault advance to the next
         attempt, and the exclusion set is what enforces that: an account already
         tried is never taken again, whatever the routing settings say.
+
+        ``options.on_delta`` / ``options.on_thinking`` are forwarded unchanged, so
+        a caller that wants incremental output sets them on ``options`` before
+        the call and receives chunks as the upstream produces them.
         """
         attempts = max(1, self._settings_fn().routing.max_attempts)
         tried: set[str] = set()
@@ -484,6 +716,19 @@ def _append_missing_media(text: str, media: list[upstream.MediaRef]) -> str:
 def _sse(event: str | None, payload: dict[str, Any]) -> bytes:
     head = f"event: {event}\n" if event else ""
     return (head + "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def _is_repeat_tail(delta: str, emitted: str) -> bool:
+    """Whether ``delta`` re-sends what has already been emitted.
+
+    The upstream closes a turn by repeating the entire answer as a single chunk.
+    Emitting it would double the reply and the reported token count, so a chunk
+    that begins with everything sent so far is treated as that repeat.  The check
+    needs enough context to be meaningful: a short answer is not deduplicated.
+    """
+    if len(emitted) < 8 or not delta:
+        return False
+    return delta.startswith(emitted)
 
 
 def _openai_stream(

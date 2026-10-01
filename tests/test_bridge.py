@@ -192,6 +192,41 @@ def test_echo_then_doubling_is_fully_removed():
     assert upstream._collapse_repeated_tail(upstream._strip_prompt_echo(raw, prompt)) == answer
 
 
+def test_streaming_echo_filter_strips_across_deltas():
+    """The stream arrives in pieces, so the echo spans several deltas.
+
+    Nothing is emitted until the whole prompt has been seen, otherwise a client
+    would briefly receive the request as if it were the answer.
+    """
+    from app import upstream
+
+    filt = upstream.StreamingEchoFilter("say hello in french")
+    emitted = []
+    for chunk in ("say he", "llo in french", "Bonjour !"):
+        emitted.append(filt.feed(chunk))
+    emitted.append(filt.flush())
+    assert "".join(emitted) == "Bonjour !"
+
+
+def test_streaming_echo_filter_passes_a_non_echo_through():
+    from app import upstream
+
+    filt = upstream.StreamingEchoFilter("say hello in french")
+    assert "".join(filt.feed(c) for c in ["Bon", "jour"]) + filt.flush() == "Bonjour"
+    # A short prompt is still checked: a reply that starts with it is stripped.
+    short = upstream.StreamingEchoFilter("hi")
+    assert "".join(short.feed(c) for c in ["hi", "! there"]) + short.flush() == "! there"
+
+
+def test_repeat_tail_detection():
+    from app import gateway
+
+    assert gateway._is_repeat_tail("hello world again", "hello world")
+    assert not gateway._is_repeat_tail("hello", "hello world")
+    # Too little context to judge, so it is never treated as a repeat.
+    assert not gateway._is_repeat_tail("hi", "hi")
+
+
 # ---------------------------------------------------------------------- media
 
 

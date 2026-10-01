@@ -493,6 +493,61 @@ def _strip_prompt_echo(text: str, prompt: str) -> str:
     return body[len(marker):].lstrip("\n\r")
 
 
+class StreamingEchoFilter:
+    """Strip a prompt echo from a *stream*, one delta at a time.
+
+    The batch form (:func:`_strip_prompt_echo`) only works once the whole answer
+    is assembled.  A real stream has to decide before it has the text, so this
+    holds deltas back until the question "does this reply start with the request
+    we sent?" is settled:
+
+    * If the accumulated text diverges from the prompt before the prompt ends,
+      it was never an echo and everything held is released.
+    * Once the held text consumes the whole prompt, the echo is confirmed and
+      the remainder — the start of the real answer — is released.
+
+    Until one of those happens nothing is emitted, so a client never sees the
+    request even transiently.
+    """
+
+    def __init__(self, prompt: str) -> None:
+        self._prompt = prompt.strip()
+        self._held = ""
+        self._settled = not self._prompt
+
+    def feed(self, delta: str) -> str:
+        """Take one delta and return the text that is safe to emit now."""
+        if not delta:
+            return ""
+        if self._settled:
+            return delta
+        self._held += delta
+        prompt = self._prompt
+        # A short prefix that still matches the prompt: keep waiting.
+        if prompt.startswith(self._held):
+            return ""
+        # The held text is a strict prefix of the prompt but has already gone
+        # past it?  Not possible; divergence is handled below.
+        if self._held.startswith(prompt):
+            # The whole prompt has arrived: drop it and emit the rest.
+            self._settled = True
+            rest = self._held[len(prompt):].lstrip("\r\n")
+            self._held = ""
+            return rest
+        # Neither a prefix nor a superset of the prompt: it was never an echo.
+        self._settled = True
+        out = self._held
+        self._held = ""
+        return out
+
+    def flush(self) -> str:
+        """Release anything still held once the stream has ended."""
+        out = self._held
+        self._held = ""
+        self._settled = True
+        return out
+
+
 def _collapse_repeated_tail(text: str) -> str:
     """Collapse an answer the upstream repeated back-to-back.
 
