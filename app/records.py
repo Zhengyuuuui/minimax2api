@@ -600,11 +600,12 @@ def builtin_models() -> list[ModelConfig]:
         ModelConfig(
             id="minimax-agent",
             name="MiniMax Agent",
-            upstream="agent",
+            upstream="chat",
+            upstream_model="MiniMax-M3.1-Flash-Preview",
             type=MODEL_CHAT,
             enabled=True,
             builtin=True,
-            description="通用 Agent，自动规划并调用工具",
+            description="默认对话模型（M3.1 Flash 预览版）",
         ),
         ModelConfig(
             id="minimax-m3",

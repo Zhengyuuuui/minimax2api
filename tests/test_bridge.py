@@ -146,26 +146,29 @@ def test_tool_and_unknown_roles_are_rendered_as_user_turns():
 # -------------------------------------------------------------- prompt echoes
 
 
-def test_strip_prompt_echo_drops_the_replayed_request():
-    """The agent replays the whole turn before answering.
+def _long_prompt() -> str:
+    """A prompt long enough for the shared-prefix echo rule to apply."""
+    return "[系统指令] You are opencode, an interactive coding agent. " + ("规则条目。\n" * 200)
 
-    The stream's first content is the flattened prompt the bridge just sent, so
-    the reply would otherwise start with the entire request — and the request is
-    what makes the token count explode after a model switch.
+
+def test_strip_prompt_echo_drops_the_replayed_request():
+    """The agent replays the request before answering, sharing a long prefix.
+
+    The echo is not byte-identical — the agent rewrites the middle — so the
+    opening is matched by the shared-prefix length, not equality.
     """
     from app import upstream
 
-    echo = "[系统指令] You are opencode, an interactive CLI tool for coding.\n\n 用户：1. hi"
-    frame = echo + "\nHi! 我是 minimax-m3.1-flash"
-    assert upstream._strip_prompt_echo(frame, echo) == "Hi! 我是 minimax-m3.1-flash"
-    # A bare question is echoed too, and stripped the same way.
-    assert upstream._strip_prompt_echo("say hi in frenchBonjour !", "say hi in french") == "Bonjour !"
+    prompt = _long_prompt()
+    # Same leading run, then the agent diverges into the answer.
+    echo = prompt[:900] + "\n\nBonjour !"
+    assert upstream._strip_prompt_echo(echo, prompt) == "Bonjour !"
 
 
 def test_strip_prompt_echo_keeps_a_real_answer_that_only_starts_alike():
     from app import upstream
 
-    # The prompt is not a prefix of the answer, so nothing is removed.
+    # Too short a shared prefix: this is an answer, not an echo.
     assert upstream._strip_prompt_echo("你好！有什么可以帮你的？", "hi") == "你好！有什么可以帮你的？"
     # An empty prompt never strips anything.
     assert upstream._strip_prompt_echo("just an answer", "") == "just an answer"
@@ -186,45 +189,93 @@ def test_echo_then_doubling_is_fully_removed():
     """The two defects stack: echo prefix plus a doubled answer."""
     from app import upstream
 
-    prompt = "say hi in french"
+    prompt = _long_prompt()
     answer = "Bonjour ! Comment ça va ?"
-    raw = prompt + answer + answer
+    # The whole answer is repeated back-to-back, which is the shape the upstream
+    # emits and the one the fold rule targets.
+    raw = prompt[:900] + answer + answer
     assert upstream._collapse_repeated_tail(upstream._strip_prompt_echo(raw, prompt)) == answer
 
 
 def test_streaming_echo_filter_strips_across_deltas():
     """The stream arrives in pieces, so the echo spans several deltas.
 
-    Nothing is emitted until the whole prompt has been seen, otherwise a client
-    would briefly receive the request as if it were the answer.
+    Nothing is emitted until the divergence is past the threshold, so a client
+    never briefly receives the request as if it were the answer.
     """
     from app import upstream
 
-    filt = upstream.StreamingEchoFilter("say hello in french")
+    prompt = _long_prompt()
+    filt = upstream.StreamingEchoFilter(prompt)
     emitted = []
-    for chunk in ("say he", "llo in french", "Bonjour !"):
+    for chunk in (prompt[:400], prompt[400:900], "你好！我是回答。"):
         emitted.append(filt.feed(chunk))
     emitted.append(filt.flush())
-    assert "".join(emitted) == "Bonjour !"
+    assert "".join(emitted) == "你好！我是回答。"
 
 
 def test_streaming_echo_filter_passes_a_non_echo_through():
     from app import upstream
 
-    filt = upstream.StreamingEchoFilter("say hello in french")
+    prompt = _long_prompt()
+    # The reply diverges from the prompt immediately, so it is an answer and is
+    # released as soon as the divergence is seen.
+    filt = upstream.StreamingEchoFilter(prompt)
     assert "".join(filt.feed(c) for c in ["Bon", "jour"]) + filt.flush() == "Bonjour"
-    # A short prompt is still checked: a reply that starts with it is stripped.
+    # A short prompt cannot produce a long shared prefix, so a reply that merely
+    # starts with it is not mistaken for an echo.
     short = upstream.StreamingEchoFilter("hi")
-    assert "".join(short.feed(c) for c in ["hi", "! there"]) + short.flush() == "! there"
+    assert "".join(short.feed(c) for c in ["hi", "! there"]) + short.flush() == "hi! there"
 
 
-def test_repeat_tail_detection():
-    from app import gateway
+def test_openai_request_converts_to_anthropic():
+    """The pure model API is Anthropic-shaped; an OpenAI caller is translated."""
+    from app import model_api
 
-    assert gateway._is_repeat_tail("hello world again", "hello world")
-    assert not gateway._is_repeat_tail("hello", "hello world")
-    # Too little context to judge, so it is never treated as a repeat.
-    assert not gateway._is_repeat_tail("hi", "hi")
+    body = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "again"},
+        ],
+        "max_tokens": 100,
+        "stream": True,
+    }
+    out = model_api.openai_to_anthropic(body, "MiniMax-M3.1-Flash-Preview")
+    assert out["model"] == "MiniMax-M3.1-Flash-Preview"
+    assert out["system"] == "be brief"
+    assert out["stream"] is True
+    assert out["max_tokens"] == 100
+    roles = [m["role"] for m in out["messages"]]
+    assert roles == ["user", "assistant", "user"]
+    # No system turn survives: it becomes the top-level system field.
+    assert all(m["role"] != "system" for m in out["messages"])
+
+
+def test_anthropic_message_converts_to_openai_with_tools():
+    from app import model_api
+
+    message = {
+        "id": "abc",
+        "stop_reason": "tool_use",
+        "content": [
+            {"type": "thinking", "thinking": "considering"},
+            {"type": "text", "text": "let me add"},
+            {"type": "tool_use", "id": "call_1", "name": "add", "input": {"a": 1, "b": 2}},
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    out = model_api.anthropic_to_openai(message, "minimax-m3.1-flash")
+    choice = out["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] == "let me add"
+    assert choice["message"]["reasoning_content"] == "considering"
+    call = choice["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "add"
+    assert call["id"] == "call_1"
+    assert out["usage"]["total_tokens"] == 15
 
 
 # ---------------------------------------------------------------------- media
@@ -332,8 +383,6 @@ def test_cancelled_request_returns_its_account_to_the_pool():
     saturated for the life of the process and every later request waits out the
     capacity timeout before failing — a hang with no error to explain it.
     """
-    from app import upstream
-
     db, _ = _fake_pool_db(1)
     holder = _SettingsHolder()
     engine = pool.Pool(db, holder.settings)
@@ -342,13 +391,12 @@ def test_cancelled_request_returns_its_account_to_the_pool():
         await engine.load()
 
         class StuckClient:
-            async def completion(self, credential, options):
+            async def llm(self, credential, body, *, stream, timeout=0.0):
                 await asyncio.Future()  # never resolves; the request is cancelled
 
         bridge = gateway.Gateway(db, engine, StuckClient(), None, holder.settings)
-        options = upstream.Options(text="hi", timeout=30.0, images=[])
         trace = gateway.Trace()
-        task = asyncio.create_task(bridge._run(options, trace))
+        task = asyncio.create_task(bridge._run_llm({"model": "x", "messages": []}, trace, stream=True))
         await asyncio.sleep(0.05)  # let it take the lease and block
         assert engine.snapshot()[0]["inflight"] == 1
         task.cancel()

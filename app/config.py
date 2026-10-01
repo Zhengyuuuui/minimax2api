@@ -48,6 +48,11 @@ class UpstreamSettings:
     # against the former and an email/overseas token only against the latter.
     base_url: str = "https://agent.minimax.io"
     base_url_cn: str = "https://agent.minimaxi.com"
+    # The direct model API the MiniMax Code desktop client talks to.  It is an
+    # Anthropic-compatible Messages endpoint (``@ai-sdk/anthropic`` in the client)
+    # and is a plain model call: structured messages, no server-side session, no
+    # prompt echo.  This is the one the bridge proxies.
+    llm_path: str = "/mavis/api/v1/llm/v1"
     # Empty on purpose: "general" is an agent *role*, and the upstream answers it
     # with a 200 that opens no session.  The real id is a per-account number,
     # discovered when the account is prepared.

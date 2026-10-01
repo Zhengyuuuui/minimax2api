@@ -464,18 +464,17 @@ def _first_deep_string(payload: dict[str, Any], keys: Iterable[str]) -> str:
 def _strip_prompt_echo(text: str, prompt: str) -> str:
     """Drop the request echoed at the front of the reply.
 
-    The MiniMax agent replays the turn it was given before it answers: the
-    stream's first ``content`` is the ``content`` the bridge just sent — the
-    flattened system prompt + history for a chat, or the bare question for a
-    single turn.  Concatenated onto the real answer it makes the reply look like
-    it starts with the entire request, which is both wrong and enormous.
+    The MiniMax agent replays the turn it was given before it answers: the reply
+    opens with the ``content`` the bridge just sent — the flattened system prompt
+    + history for a chat, or the bare question for a single turn.  Concatenated
+    onto the real answer it makes the reply look like it starts with the entire
+    request, which is both wrong and enormous.
 
-    The prompt is matched as a *leading prefix* (whitespace-insensitive), because
-    that is exactly where the echo lands; text after it is the real answer and is
-    kept.  A prompt whose leading run is also a plausible answer start (a bare
-    ``hi``) is still stripped only when the whole prompt is present as a prefix,
-    so an answer that merely begins with the same word is not mistaken for an
-    echo.
+    The echo is not an exact copy: the agent keeps a long leading run of the
+    request and then drops or rewrites the middle before continuing into the
+    answer.  So the opening is matched by the length of the shared prefix with the
+    prompt rather than by equality — see :class:`StreamingEchoFilter`, which uses
+    the same rule for the streaming path.
     """
     if not prompt or not text:
         return text
@@ -483,31 +482,35 @@ def _strip_prompt_echo(text: str, prompt: str) -> str:
     if not marker:
         return text
     body = text.lstrip()
-    if not body.startswith(marker):
-        # The echo can also be re-wrapped without the leading whitespace the
-        # request carried; try the exact prefix before giving up.
-        if not text.startswith(marker):
-            return text
-        body = text
-    # Drop the separator whitespace the echo left between itself and the answer.
-    return body[len(marker):].lstrip("\n\r")
+    shared = _common_prefix_len(body, marker)
+    if shared < _ECHO_MIN_PREFIX:
+        return text
+    return body[shared:].lstrip("\n\r")
+
+
+# The prefix of a reply that matches the request before the echo is trusted as
+# one.  A genuine answer almost never shares thousands of leading characters with
+# the prompt, so this is far above coincidence while staying well below the size
+# of a real request.
+_ECHO_MIN_PREFIX = 512
 
 
 class StreamingEchoFilter:
     """Strip a prompt echo from a *stream*, one delta at a time.
 
-    The batch form (:func:`_strip_prompt_echo`) only works once the whole answer
-    is assembled.  A real stream has to decide before it has the text, so this
-    holds deltas back until the question "does this reply start with the request
-    we sent?" is settled:
+    The agent replays the turn before answering, but not as a byte-for-byte copy
+    of what was sent: it keeps a long leading run of the request and then drops
+    or rewrites the middle (the system-reminder / skills block) before continuing
+    into the answer.  Exact-prefix matching therefore never fires on the real
+    traffic, and the reply reaches the client with the whole request in front of
+    it.
 
-    * If the accumulated text diverges from the prompt before the prompt ends,
-      it was never an echo and everything held is released.
-    * Once the held text consumes the whole prompt, the echo is confirmed and
-      the remainder — the start of the real answer — is released.
-
-    Until one of those happens nothing is emitted, so a client never sees the
-    request even transiently.
+    The test is the *length of the shared prefix*.  While the held text still
+    agrees with the prompt from the first character, it is a candidate echo and
+    is withheld; once the point of divergence is at least ``_ECHO_MIN_PREFIX``
+    characters in, the opening is confirmed as an echo and dropped.  A divergence
+    before that means it was an answer all along and everything held is released.
+    A client never sees the request, only a slightly later first byte.
     """
 
     def __init__(self, prompt: str) -> None:
@@ -523,29 +526,43 @@ class StreamingEchoFilter:
             return delta
         self._held += delta
         prompt = self._prompt
-        # A short prefix that still matches the prompt: keep waiting.
-        if prompt.startswith(self._held):
+        shared = _common_prefix_len(self._held, prompt)
+        # Still matching the prompt from the start: a candidate echo, keep it.
+        if shared == len(self._held) and len(self._held) <= len(prompt):
             return ""
-        # The held text is a strict prefix of the prompt but has already gone
-        # past it?  Not possible; divergence is handled below.
-        if self._held.startswith(prompt):
-            # The whole prompt has arrived: drop it and emit the rest.
+        # Divergence past the threshold: the opening was an echo, drop it.
+        if shared >= _ECHO_MIN_PREFIX:
             self._settled = True
-            rest = self._held[len(prompt):].lstrip("\r\n")
+            out = self._held[shared:].lstrip("\r\n")
             self._held = ""
-            return rest
-        # Neither a prefix nor a superset of the prompt: it was never an echo.
+            return out
+        # Diverged too early: it was never an echo.
         self._settled = True
         out = self._held
         self._held = ""
         return out
 
     def flush(self) -> str:
-        """Release anything still held once the stream has ended."""
+        """Release anything still held once the stream has ended.
+
+        A stream that ends while still matching the prompt is a pure echo with
+        no answer (or an answer so short it is indistinguishable); emitting
+        nothing is correct there.
+        """
         out = self._held
         self._held = ""
         self._settled = True
+        if _common_prefix_len(out, self._prompt) >= _ECHO_MIN_PREFIX:
+            return ""
         return out
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    limit = min(len(a), len(b))
+    index = 0
+    while index < limit and a[index] == b[index]:
+        index += 1
+    return index
 
 
 def _collapse_repeated_tail(text: str) -> str:
@@ -1021,6 +1038,71 @@ class MiniMaxClient:
             sign_url = signed
         return Target(method=method, url=wire, sign_url=sign_url, unix_ms=unix_ms, body=body)
 
+    # ------------------------------------------------------------- model API
+
+    def llm_url(self, settings: Settings, cred: Credential, suffix: str = "") -> str:
+        """The direct model API URL for one account.
+
+        Two hosts, chosen by region exactly like the rest of the bridge, and no
+        signing: this endpoint authenticates with the Bearer token alone, which is
+        what the desktop client sends.
+        """
+        base = cred.base_url.rstrip("/") if cred.base_url else (
+            settings.upstream.base_url_cn if cred.region == REGION_CN else settings.upstream.base_url
+        ).rstrip("/")
+        path = (settings.upstream.llm_path or "/mavis/api/v1/llm/v1").rstrip("/")
+        return f"{base}{path}{suffix}"
+
+    def _llm_headers(self, cred: Credential) -> dict[str, str]:
+        return {
+            "authorization": f"Bearer {cred.bearer or cred.token}",
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "accept": "application/json",
+        }
+
+    async def llm(
+        self,
+        cred: Credential,
+        body: dict[str, Any],
+        *,
+        stream: bool,
+        timeout: float = 0.0,
+    ) -> httpx.Response:
+        """Send one Messages request to the direct model API.
+
+        The caller owns the response and must close it; a streaming response is
+        returned as-is so the caller can relay it frame by frame.  Non-2xx is
+        raised as an upstream error so the failover loop can try another account.
+        """
+        if not cred.authenticates():
+            raise InvalidCredential("empty token")
+        settings = self._settings_fn()
+        timeout = timeout or float(settings.upstream.request_timeout_sec)
+        suffix = "/messages"
+        url = self.llm_url(settings, cred, suffix)
+        headers = self._llm_headers(cred)
+        if stream:
+            headers["accept"] = "text/event-stream"
+        client = self._client_for(settings, self.base_url(settings, cred))
+        request = client.build_request(
+            "POST", url, headers=headers,
+            content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            timeout=timeout,
+        )
+        try:
+            response = await client.send(request, stream=stream)
+        except httpx.HTTPError as err:
+            raise _safe_transport_error(err, cred) from err
+        if response.status_code in (401, 403):
+            await response.aclose()
+            raise InvalidCredential(f"minimax llm HTTP {response.status_code}")
+        if response.status_code >= 400:
+            raw = (await response.aread()).decode("utf-8", "replace")
+            await response.aclose()
+            raise UpstreamError(f"minimax llm HTTP {response.status_code}: {_snippet(raw)}")
+        return response
+
     def signin_target(self, cred: Credential, path: str, *, method: str = "GET", body: str = "") -> Target:
         """Assemble a check-in call.  Signs the relative path, not the URL."""
         settings = self._settings_fn()
@@ -1299,13 +1381,20 @@ class MiniMaxClient:
         return session_id
 
     async def probe(self, cred: Credential) -> int:
-        """Validate a credential by opening a session and discarding it.
+        """Validate a credential with the cheapest authenticated model call.
 
-        Creating a session is the cheapest authenticated call available: it proves
-        the token and fingerprint pair is accepted without spending a turn.
+        A one-token Messages request proves the Bearer token is accepted on the
+        direct model API — the same path every real request uses — without
+        spending a meaningful turn.
         """
         started = time.monotonic()
-        await self.create_session(cred)
+        body = {
+            "model": "MiniMax-M3.1-Flash-Preview",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+        response = await self.llm(cred, body, stream=False, timeout=30.0)
+        await response.aclose()
         return int((time.monotonic() - started) * 1000)
 
     # ---------------------------------------------------------------- completion

@@ -22,7 +22,6 @@ tell "retry everything" from "this stream died".
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -30,9 +29,9 @@ from typing import Any, AsyncIterator
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import model_api as proxy
 from . import pool as pool_mod
 from . import upstream
-from .prompt import Turn, build_prompt, parse_turn
 from .records import (
     AUDIT_ERROR,
     AUDIT_OK,
@@ -74,20 +73,8 @@ class ChatRequest:
     """A parsed request, in the parts the bridge actually uses."""
 
     model: str
-    messages: list[Turn] = field(default_factory=list)
     stream: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def prompt(self) -> str:
-        return build_prompt(self.messages)
-
-    @property
-    def images(self) -> list[str]:
-        out: list[str] = []
-        for turn in self.messages:
-            out.extend(turn.image_urls())
-        return out
 
 
 @dataclass
@@ -213,45 +200,29 @@ class Gateway:
         return await self._respond(request, chat, model, trace, "anthropic")
 
     def parse_chat(self, body: Any, *, anthropic: bool = False) -> ChatRequest:
-        """Read a request body, refusing the ones that cannot be served."""
+        """Read a request body, refusing the ones that cannot be served.
+
+        The body is forwarded as structured messages, so this only validates the
+        shape it needs to route on: a non-empty ``messages`` array and a model.
+        The upstream expects the caller's own message shape, so nothing is
+        flattened or reshaped here.
+        """
         if not isinstance(body, dict):
             raise APIError(400, "invalid_request", "request body must be a JSON object")
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise APIError(400, "invalid_request", "messages must be a non-empty array")
 
-        turns: list[Turn] = []
-        # Anthropic's `system` is a separate field.  It is folded into the history
-        # as its leading entry rather than dropped: the upstream has no role of its
-        # own to map it onto, and an unlabelled instruction is how the web client
-        # sends one.
-        system = body.get("system")
-        if isinstance(system, str) and system.strip():
-            turns.append(Turn(role="system", content=system))
-        elif isinstance(system, list):
-            text = "\n".join(
-                block.get("text", "")
-                for block in system
-                if isinstance(block, dict) and isinstance(block.get("text"), str)
-            )
-            if text.strip():
-                turns.append(Turn(role="system", content=text))
-
-        for item in messages:
-            turn = parse_turn(item)
-            if turn is not None:
-                turns.append(turn)
-        if not turns:
-            raise APIError(400, "invalid_request", "no usable messages in the request")
-
         model_id = body.get("model")
         model_id = model_id.strip() if isinstance(model_id, str) else ""
         if not model_id:
             raise APIError(400, "invalid_request", "model is required")
-        return ChatRequest(model=model_id, messages=turns, stream=bool(body.get("stream")), raw=body)
+        return ChatRequest(model=model_id, stream=bool(body.get("stream")), raw=body)
 
     def _trace(self, request: Any, chat: ChatRequest) -> Trace:
-        trace = Trace(stream=chat.stream, model=chat.model, prompt_text=chat.prompt)
+        # The direct model API takes structured messages, so there is no flattened
+        # prompt to record; the request body itself is the audit trail.
+        trace = Trace(stream=chat.stream, model=chat.model)
         client = request.client
         trace.ip = client.host if client else ""
         trace.user_agent = request.headers.get("user-agent") or ""
@@ -262,45 +233,32 @@ class Gateway:
 
     # ---------------------------------------------------------------- answering
 
-    def _model_selection(self, model: ModelConfig) -> dict[str, Any]:
-        """The upstream model selector for a catalogue entry.
-
-        The upstream takes an object — ``{model_id, provider_id, variant}`` — not
-        the id string, and rejects a bare string or a bare ``model_id``.  An entry
-        with no ``upstream_model`` (the agent default) sends nothing, which lets
-        the account's own default answer.
-        """
-        if not model.upstream_model:
-            return {}
-        selection: dict[str, Any] = {"model_id": model.upstream_model}
-        if model.variant:
-            selection["variant"] = model.variant
-        return selection
-
     async def _respond(
         self, request: Any, chat: ChatRequest, model: ModelConfig, trace: Trace, dialect: str
     ) -> Any:
-        prompt = chat.prompt
-        trace.prompt_tokens = estimate_tokens(prompt)
-        options = upstream.Options(
-            text=prompt,
-            timeout=float(self._settings_fn().upstream.request_timeout_sec),
-            images=[upstream.UploadedImage(url=url) for url in chat.images],
-            model=self._model_selection(model),
-        )
+        """Answer one turn through the direct model API.
+
+        The upstream is Anthropic-shaped, so an Anthropic caller is forwarded as
+        it stands and an OpenAI caller is translated on the way out and back on
+        the way in.  Either way the body is sent as structured messages: no
+        flattened prompt, no server-side session, no echo.
+        """
+        if dialect == "anthropic":
+            upstream_body = self._anthropic_body(chat, model)
+        else:
+            upstream_body = proxy.openai_to_anthropic(chat.raw, model.upstream_model)
 
         if chat.stream:
             return StreamingResponse(
-                self._stream(request, chat, model, trace, options, dialect),
+                self._stream(model, trace, upstream_body, dialect),
                 media_type="text/event-stream",
-                # Both headers matter: the second disables buffering in reverse
-                # proxies, which would otherwise hold the whole stream back.
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
         try:
-            result = await self._run(options, trace)
-            text = await self._finalize(result, trace, model)
+            response = await self._run_llm(upstream_body, trace, stream=False)
+            raw = await response.aread()
+            await response.aclose()
         except upstream.InvalidCredential as err:
             trace.finish(status=502, error=err)
             await self._db.append_audit(trace.record())
@@ -314,276 +272,82 @@ class Gateway:
             await self._db.append_audit(trace.record())
             raise APIError(503, "no_account", err.reason) from err
 
+        try:
+            message = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError as err:
+            trace.finish(status=502, error=err)
+            await self._db.append_audit(trace.record())
+            raise APIError(502, "upstream_error", "upstream returned invalid JSON") from err
+
+        usage = message.get("usage") or {}
+        trace.prompt_tokens = int(usage.get("input_tokens") or 0)
+        trace.completion_tokens = int(usage.get("output_tokens") or 0)
+        trace.response_body = json.dumps(message, ensure_ascii=False)[: self._settings_fn().audit.body_limit_bytes]
+        await self._db.record_model_usage(model.id, 1, trace.completion_tokens)
         trace.finish(status=200)
         await self._db.append_audit(trace.record())
+
         if dialect == "anthropic":
-            return JSONResponse(_anthropic_message(result, text, model.id, trace))
-        return JSONResponse(_openai_message(text, model.id, trace))
+            return JSONResponse(message)
+        return JSONResponse(proxy.anthropic_to_openai(message, model.id))
+
+    def _anthropic_body(self, chat: ChatRequest, model: ModelConfig) -> dict[str, Any]:
+        """Read the caller's Anthropic body, swapping in the upstream model id."""
+        body = dict(chat.raw)
+        body["model"] = model.upstream_model
+        body.pop("stream", None) if not chat.stream else None
+        if chat.stream:
+            body["stream"] = True
+        if "max_tokens" not in body:
+            body["max_tokens"] = 4096
+        return body
 
     async def _stream(
         self,
-        request: Any,
-        chat: ChatRequest,
         model: ModelConfig,
         trace: Trace,
-        options: upstream.Options,
+        upstream_body: dict[str, Any],
         dialect: str,
     ) -> AsyncIterator[bytes]:
-        """Relay the upstream answer as it arrives.
+        """Relay the upstream SSE stream, translating for OpenAI callers.
 
-        The upstream holds the connection open between turns, so waiting for the
-        whole reply before writing the first byte makes a slow turn look like a
-        hang and lets a client that watches for first-byte latency time out.
-        The deltas are bridged through a queue instead: the upstream call runs as
-        a task and pushes chunks, and this generator forwards them as they land.
-
-        Output is incremental, so the prompt-echo filter has to work on a stream
-        (``StreamingEchoFilter``).  It holds the opening deltas until it can tell
-        whether the reply starts with the request, and only then releases them —
-        the client never sees the echo, only a slightly later first byte.
+        Anthropic callers get the upstream's own frames; OpenAI callers get them
+        converted.  The account is released only when the stream is finished, so
+        the retry-on-another-account rule stays per-request.
         """
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-        text_filter = upstream.StreamingEchoFilter(options.text)
-        think_filter = upstream.StreamingEchoFilter(options.text)
-
-        openai = dialect == "openai"
-        created = int(time.time())
-        response_id = "chatcmpl-" + new_id() if openai else "msg_" + new_id()
-        block_index = 0
-        thinking_open = False
-        text_open = False
-
-        def enqueue(kind: str, value: Any) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, (kind, value))
-
-        def on_delta(chunk: str) -> None:
-            safe = text_filter.feed(chunk)
-            if safe:
-                enqueue("text", safe)
-
-        def on_thinking(chunk: str) -> None:
-            safe = think_filter.feed(chunk)
-            if safe:
-                enqueue("thinking", safe)
-
-        options.on_delta = on_delta
-        options.on_thinking = on_thinking
-
-        async def run() -> None:
-            try:
-                result = await self._run(options, trace)
-                # The streamed answer is what the client received; the audit
-                # records the assembled text and its estimated size, matching
-                # the non-streaming path.
-                answer = result.text
-                trace.response_body = answer
-                trace.completion_tokens = estimate_tokens(answer) + (
-                    estimate_tokens(result.thinking) if result.thinking else 0
-                )
-                await self._db.record_model_usage(model.id, 1, trace.completion_tokens)
-                trace.finish(status=200)
-                await self._db.append_audit(trace.record())
-                enqueue("done", result)
-            except BaseException as err:  # noqa: BLE001 - anything left is reported here
-                trace.finish(status=502, error=err)
-                await self._db.append_audit(trace.record())
-                enqueue("error", err)
-            finally:
-                enqueue("end", None)
-
-        task = asyncio.create_task(run())
-
-        # Opening frames: OpenAI wants the role first; Anthropic wants a
-        # message_start and, if it ever appears, a thinking block ahead of text.
-        if openai:
-            yield _sse(
-                None,
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model.id,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-                },
-            )
-        else:
-            yield _sse(
-                "message_start",
-                {
-                    "type": "message_start",
-                    "message": {
-                        "id": response_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "model": model.id,
-                        "content": [],
-                        "usage": {"input_tokens": trace.prompt_tokens, "output_tokens": 0},
-                    },
-                },
-            )
-
-        def delta_frame(kind: str, text: str) -> bytes:
-            nonlocal block_index, thinking_open, text_open
-            if openai:
-                key = "reasoning_content" if kind == "thinking" else "content"
-                return _sse(
-                    None,
-                    {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model.id,
-                        "choices": [{"index": 0, "delta": {key: text}, "finish_reason": None}],
-                    },
-                )
-            if kind == "thinking":
-                if not thinking_open:
-                    thinking_open = True
-                    head = _sse(
-                        "content_block_start",
-                        {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {"type": "thinking", "thinking": ""},
-                        },
-                    )
-                else:
-                    head = b""
-                return head + _sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "thinking_delta", "thinking": text},
-                    },
-                )
-            head = b""
-            if not text_open:
-                if thinking_open:
-                    head += _sse(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": block_index},
-                    )
-                    block_index += 1
-                text_open = True
-                head += _sse(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-            return head + _sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {"type": "text_delta", "text": text},
-                },
-            )
-
-        result: upstream.Result | None = None
-        error: BaseException | None = None
-        emitted = ""
+        upstream_body["stream"] = True
         try:
-            while True:
-                kind, value = await queue.get()
-                if kind == "end":
-                    break
-                if kind == "error":
-                    error = value
-                    continue
-                if kind == "done":
-                    result = value
-                    # Anything the filters held back is part of the answer; emit
-                    # it now that the stream has ended.
-                    tail = text_filter.flush()
-                    if tail and not _is_repeat_tail(tail, emitted):
-                        emitted += tail
-                        yield delta_frame("text", tail)
-                    tail = think_filter.flush()
-                    if tail:
-                        yield delta_frame("thinking", tail)
-                    continue
-                if kind == "text":
-                    # The upstream re-sends the whole answer as one final chunk.
-                    # Forwarding it would double the reply and the token count.
-                    if _is_repeat_tail(value, emitted):
-                        continue
-                    emitted += value
-                yield delta_frame(kind, value)
-        finally:
-            if not task.done():
-                task.cancel()
-            with contextlib.suppress(BaseException):
-                await task
-
-        if error is not None:
-            yield _error_frame(error, dialect)
+            response = await self._run_llm(upstream_body, trace, stream=True)
+        except BaseException as err:  # noqa: BLE001 - reported as a frame below
+            trace.finish(status=502, error=err)
+            await self._db.append_audit(trace.record())
+            yield _error_frame(err, dialect)
             return
 
-        # Close the stream in the client's dialect.
-        if openai:
-            yield _sse(
-                None,
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model.id,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    "usage": {
-                        "prompt_tokens": trace.prompt_tokens,
-                        "completion_tokens": trace.completion_tokens,
-                        "total_tokens": trace.prompt_tokens + trace.completion_tokens,
-                    },
-                },
-            )
-            yield b"data: [DONE]\n\n"
-        else:
-            if thinking_open:
-                yield _sse(
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": block_index},
-                )
-                block_index += 1
-            if not text_open:
-                yield _sse(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-            yield _sse(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": block_index},
-            )
-            yield _sse(
-                "message_delta",
-                {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                    "usage": {"output_tokens": trace.completion_tokens},
-                },
-            )
-            yield _sse("message_stop", {"type": "message_stop"})
+        frames = _aiter_sse(response)
+        if dialect == "openai":
+            frames = proxy.anthropic_stream_to_openai(frames, model.id)
+        try:
+            async for frame in frames:
+                yield frame
+        except BaseException as err:  # noqa: BLE001 - partial output already sent
+            trace.finish(status=502, error=err)
+            await self._db.append_audit(trace.record())
+            return
+        finally:
+            await response.aclose()
 
-    async def _run(
-        self, options: upstream.Options, trace: Trace
-    ) -> upstream.Result:
-        """The failover loop.
+        trace.finish(status=200)
+        await self._db.append_audit(trace.record())
 
-        Only failures that were the *account's* fault advance to the next
-        attempt, and the exclusion set is what enforces that: an account already
-        tried is never taken again, whatever the routing settings say.
+    async def _run_llm(
+        self, body: dict[str, Any], trace: Trace, *, stream: bool
+    ) -> Any:
+        """The failover loop for the direct model API.
 
-        ``options.on_delta`` / ``options.on_thinking`` are forwarded unchanged, so
-        a caller that wants incremental output sets them on ``options`` before
-        the call and receives chunks as the upstream produces them.
+        Only failures that were the *account's* fault advance to the next attempt;
+        a credential refused by the upstream is reported at once rather than
+        retried into the same rejection.
         """
         attempts = max(1, self._settings_fn().routing.max_attempts)
         tried: set[str] = set()
@@ -606,18 +370,9 @@ class Gateway:
             released = False
             try:
                 try:
-                    result = await self._client.completion(credential, options)
-                except upstream.AgentIDUnknown as err:
-                    # Nothing is wrong with the account's health, it simply has
-                    # no agent id yet.  No cooldown: that is for accounts being
-                    # rate limited, and this one is not.
+                    response = await self._client.llm(credential, body, stream=stream)
+                except upstream.InvalidCredential:
                     await self._pool.release(lease, success=False, error=None)
-                    released = True
-                    tried.add(lease.account.id)
-                    last = err
-                    continue
-                except upstream.InvalidCredential as err:
-                    await self._pool.release(lease, success=False, error=err)
                     released = True
                     raise
                 except upstream.UpstreamError as err:
@@ -636,20 +391,9 @@ class Gateway:
                 await self._pool.release(lease, success=True)
                 released = True
                 trace.latency_ms = int((time.monotonic() - started) * 1000)
-                return result
+                return response
             finally:
-                # A cancelled request must not keep its account out of the pool.
-                # ``CancelledError`` is a BaseException, so none of the handlers
-                # above catch it and the lease would otherwise be leaked with its
-                # ``inflight`` count permanently incremented — which pins the
-                # account at ``max_concurrent`` for the life of the process.
-                # ``error=None`` gives the account back without recording a
-                # failure: a client hanging up says nothing about the credential.
                 if not released:
-                    # Shielded: while the task is unwinding from a cancellation,
-                    # any new ``await`` here would be cancelled too and the
-                    # account would stay pinned.  The release is cheap and must
-                    # still happen.
                     await asyncio.shield(
                         self._pool.release(lease, success=False, error=None)
                     )
@@ -657,195 +401,32 @@ class Gateway:
         assert last is not None
         raise last
 
-    async def _finalize(
-        self, result: upstream.Result, trace: Trace, model: ModelConfig
-    ) -> str:
-        """Turn a finished turn into the text the client gets.
+def _aiter_sse(response: Any) -> AsyncIterator[bytes]:
+    """Yield the upstream's SSE frames one whole event at a time.
 
-        Media is fetched here, before the serialisers run, so that a failed
-        download leaves the upstream's URL in place rather than an empty link.
-        """
-        # Belt and braces: a frame-level echo strip already ran while streaming,
-        # but an echo split across frames can only be removed once the whole
-        # answer is assembled.  Both are narrow and leave real answers alone.
-        text = upstream._strip_prompt_echo(result.text, trace.prompt_text)
-        text = upstream._collapse_repeated_tail(text)
-        if self._settings_fn().media.auto_download:
-            for ref in result.media:
-                item = await self._media.download(
-                    ref.url,
-                    prompt=trace.prompt_text[:2000],
-                    model=model.id,
-                    account_name=trace.account_name,
-                )
-                # The reference itself is updated, not just the text: an agent
-                # that never wrote the markdown gets the appended link from the
-                # same source, and it would otherwise point at a URL that is about
-                # to expire.
-                if item is not None:
-                    ref.url = item.url
-                    text = text.replace(item.source_url, item.url)
-        text = _append_missing_media(text, result.media)
-        trace.response_body = text
-        trace.completion_tokens = estimate_tokens(text) + (
-            estimate_tokens(result.thinking) if result.thinking else 0
-        )
-        # Counted once per request, not per token: the counters are a signal for
-        # the console, not a billing log.
-        await self._db.record_model_usage(model.id, 1, trace.completion_tokens)
-        return text
-
-
-def _append_missing_media(text: str, media: list[upstream.MediaRef]) -> str:
-    """Link any generated asset the agent did not mention.
-
-    The upstream usually writes the markdown itself.  When it does not, the image
-    is still real and the client should still see it.
+    ``aiter_bytes`` — not ``aiter_raw`` — because the transport may have
+    negotiated gzip and the frames have to be decoded before a client can read
+    them.  Chunks may split or merge events, so the blank-line delimiter is what
+    is forwarded, not the transport chunk.
     """
-    missing = [ref.url for ref in media if ref.url and ref.url not in text]
-    if not missing:
-        return text
-    if text and not text.endswith("\n"):
-        text += "\n"
-    return text + "\n" + "\n".join(f"![image]({url})" for url in missing)
+    buffer = b""
 
+    async def generate() -> AsyncIterator[bytes]:
+        nonlocal buffer
+        async for chunk in response.aiter_bytes():
+            buffer += chunk
+            while b"\n\n" in buffer:
+                frame, buffer = buffer.split(b"\n\n", 1)
+                yield frame + b"\n\n"
+        if buffer.strip():
+            yield buffer
 
-# --------------------------------------------------------------------- OpenAI
+    return generate()
 
 
 def _sse(event: str | None, payload: dict[str, Any]) -> bytes:
     head = f"event: {event}\n" if event else ""
     return (head + "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
-
-
-def _is_repeat_tail(delta: str, emitted: str) -> bool:
-    """Whether ``delta`` re-sends what has already been emitted.
-
-    The upstream closes a turn by repeating the entire answer as a single chunk.
-    Emitting it would double the reply and the reported token count, so a chunk
-    that begins with everything sent so far is treated as that repeat.  The check
-    needs enough context to be meaningful: a short answer is not deduplicated.
-    """
-    if len(emitted) < 8 or not delta:
-        return False
-    return delta.startswith(emitted)
-
-
-def _openai_stream(
-    result: upstream.Result, text: str, model: str, trace: Trace
-) -> list[bytes]:
-    """The answer as a single content chunk, then the stop frame.
-
-    One chunk rather than one per token: the upstream's stream is not the client's
-    — it pauses between tool calls — so splitting it would produce a tokenizer
-    that does not exist, at the cost of a stream that stalls.
-    """
-    created = int(time.time())
-    response_id = "chatcmpl-" + new_id()
-
-    def chunk(delta: dict[str, Any], finish: str | None = None, usage: bool = False) -> bytes:
-        payload: dict[str, Any] = {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-        }
-        if usage:
-            payload["usage"] = {
-                "prompt_tokens": trace.prompt_tokens,
-                "completion_tokens": trace.completion_tokens,
-                "total_tokens": trace.prompt_tokens + trace.completion_tokens,
-            }
-        return _sse(None, payload)
-
-    return [
-        chunk({"role": "assistant"}),
-        chunk({"content": text}),
-        chunk({}, "stop", usage=True),
-        b"data: [DONE]\n\n",
-    ]
-
-
-def _openai_message(text: str, model: str, trace: Trace) -> dict[str, Any]:
-    return {
-        "id": "chatcmpl-" + new_id(),
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [
-            {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
-        ],
-        "usage": {
-            "prompt_tokens": trace.prompt_tokens,
-            "completion_tokens": trace.completion_tokens,
-            "total_tokens": trace.prompt_tokens + trace.completion_tokens,
-        },
-    }
-
-
-# ------------------------------------------------------------------ Anthropic
-
-
-def _anthropic_stream(
-    result: upstream.Result, text: str, model: str, trace: Trace
-) -> list[bytes]:
-    message_id = "msg_" + new_id()
-    frames = [
-        _sse(
-            "message_start",
-            {
-                "type": "message_start",
-                "message": {
-                    "id": message_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": model,
-                    "content": [],
-                    "usage": {"input_tokens": trace.prompt_tokens, "output_tokens": 0},
-                },
-            },
-        )
-    ]
-
-    index = 0
-    # Thinking is a separate block, ahead of the answer, because Anthropic clients
-    # look for the text block and drop anything else.
-    if result.thinking:
-        frames += [
-            _sse("content_block_start", {"type": "content_block_start", "index": index, "content_block": {"type": "thinking", "thinking": ""}}),
-            _sse("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "thinking_delta", "thinking": result.thinking}}),
-            _sse("content_block_stop", {"type": "content_block_stop", "index": index}),
-        ]
-        index += 1
-
-    frames += [
-        _sse("content_block_start", {"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}}),
-        _sse("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": text}}),
-        _sse("content_block_stop", {"type": "content_block_stop", "index": index}),
-        _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": trace.completion_tokens}}),
-        _sse("message_stop", {"type": "message_stop"}),
-    ]
-    return frames
-
-
-def _anthropic_message(
-    result: upstream.Result, text: str, model: str, trace: Trace
-) -> dict[str, Any]:
-    content: list[dict[str, str]] = []
-    if result.thinking:
-        content.append({"type": "thinking", "thinking": result.thinking})
-    content.append({"type": "text", "text": text})
-    return {
-        "id": "msg_" + new_id(),
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": content,
-        "stop_reason": "end_turn",
-        "stop_sequence": None,
-        "usage": {"input_tokens": trace.prompt_tokens, "output_tokens": trace.completion_tokens},
-    }
 
 
 def _error_frame(err: BaseException, dialect: str) -> bytes:

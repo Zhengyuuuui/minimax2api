@@ -4,6 +4,19 @@
 
 ## 📝 更新日志
 
+### 本次更新（改用官方直连模型 API，彻底告别黑盒 Agent 的 echo / 卡顿 / 上下文爆炸）
+
+- **重大变更：上游从「Agent 会话接口」切换为「直连模型 API」**。此前请求的是 MiniMax Code 的 Agent 会话端点（`/minimax-cloud/api/v1/session/{id}/message`，单段 `content` 字符串），那是一条黑盒链路：会把整轮 prompt 原样回显、把回答重复两遍、每轮全量重发上下文，切换模型后单请求可达 38 万 token、首字节迟滞数十秒。现改为官方客户端真正使用的直连模型端点：
+  ```
+  POST https://agent.minimax.io/mavis/api/v1/llm/v1/messages
+  ```
+  这是标准 Anthropic Messages 协议（结构化 messages、tool use、SSE），**无会话、无回显、无重复、上下文由客户端自管**。
+- **双协议对外**：`/v1/messages`（Anthropic）原样透传；`/v1/chat/completions`（OpenAI）在 `app/model_api.py` 中做双向转换（含流式：Anthropic SSE → OpenAI SSE，覆盖 text / thinking / tool_calls）。
+- **鉴权**：仅需 `Authorization: Bearer <token>`（与既有账号池 OAuth 完全一致），无需 `x-signature` / `yy` 签名。
+- **移除**：黑盒 Agent 的 `build_prompt` 拍平、`StreamingEchoFilter` 回显剥离、`_is_repeat_tail` 重复抑制、伪流式队列桥接等一整条链路（不再需要）。
+- **账号探测**改为一次最小的 `Messages` 调用，直接验证模型的 Bearer token。
+- 模型目录沿用上游真实 id：`MiniMax-M3.1-Flash-Preview` / `MiniMax-M3` / `MiniMax-M2.7(-highspeed)` 等。
+
 ### 本次更新（真流式转发 · 修复“一直 wait response”）
 
 - **修复：流式请求长时间无任何输出，客户端超时后 502**。`gateway._stream` 此前是**伪流式**——先 `await self._run(...)` 等上游把整轮生成完，再一次性吐出所有帧。上游在轮次之间会保持连接，于是首字节延迟等于整个生成耗时；只发一句 `hi` 也要等上游完整返回，客户端（opencode / Grok CLI）等不到首字节便断开，审计记为 `502 Cancelled via cancel scope`、`latency_ms=0`。改用 `asyncio.Queue` 桥接：上游调用作为任务运行，逐 delta 入队，生成器边到边转发，**首字节延迟从数十秒降到毫秒级**。
@@ -214,21 +227,19 @@ curl http://127.0.0.1:4555/v1/chat/completions \
 
 ## 模型列表
 
-| 模型 ID | 显示名 | 类型 | 说明 |
+| 模型 ID | 显示名 | 上游 model | 说明 |
 |---|---|---|---|
-| `minimax-agent` | MiniMax Agent | chat | 通用 Agent，自动规划并调用工具（不发 model，用账号默认） |
-| `minimax-m3.1-flash` | MiniMax M3.1 Flash Preview | chat | 新一代 Flash 预览版，512K / 可选 1M 上下文 |
-| `minimax-m3.1-flash-thinking` | MiniMax M3.1 Flash Preview Thinking | chat | M3.1 Flash 预览版的深度思考变体 |
-| `minimax-m3` | MiniMax M3 | chat | 对话模式，响应更快 |
-| `minimax-m3-thinking` | MiniMax M3 Thinking | chat | 深度思考变体 |
-| `minimax-m2.7` | MiniMax M2.7 | chat | 上一代对话模型 |
-| `minimax-m2.7-highspeed` | MiniMax M2.7 HighSpeed | chat | 上一代高速版 |
-| `minimax-image` | MiniMax Image | image | 图像生成，图片以 Markdown 返回 |
+| `minimax-agent` | MiniMax Agent | `MiniMax-M3.1-Flash-Preview` | 默认对话模型 |
+| `minimax-m3.1-flash` | MiniMax M3.1 Flash Preview | `MiniMax-M3.1-Flash-Preview` | 新一代 Flash 预览版，512K / 可选 1M 上下文 |
+| `minimax-m3.1-flash-thinking` | MiniMax M3.1 Flash Preview Thinking | `MiniMax-M3.1-Flash-Preview` | 深度思考（thinking 由模型自身产生） |
+| `minimax-m3` | MiniMax M3 | `MiniMax-M3` | 对话模式 |
+| `minimax-m3-thinking` | MiniMax M3 Thinking | `MiniMax-M3` | 深度思考变体 |
+| `minimax-m2.7` | MiniMax M2.7 | `MiniMax-M2.7` | 上一代对话模型 |
+| `minimax-m2.7-highspeed` | MiniMax M2.7 HighSpeed | `MiniMax-M2.7-highspeed` | 上一代高速版 |
 
-> 所有 chat 模型到达的是同一个上游 agent；模型条目决定发送的 `model` 选择对象
-> `{"model_id": <upstream_model>, "provider_id": "minimax", "variant": "thinking"|""}`。
-> 上游的模型清单可实时读取：`GET /minimax-cloud/api/v1/config` 的 `models` 字段
-> （当前含 `MiniMax-M3.1-Flash-Preview`、`MiniMax-M3`、`MiniMax-M2.7`、`MiniMax-M2.7-highspeed`）。
+> 模型条目里的 `upstream_model` 就是直接发给直连模型 API 的 `model` 字段。上游的模型清单可实时读取：
+> `GET /mavis/api/v1/models`（含 `MiniMax-M3.1-Flash-Preview`、`MiniMax-M3`、`MiniMax-M2.7`、
+> `MiniMax-M2.7-highspeed`、`MiniMax-M2.5`）。thinking 由模型自身决定，不再需要单独的 variant 参数。
 
 ## API 接口
 
@@ -348,24 +359,21 @@ cp .env.example .env   # 模板，逐项有注释
 ## 技术细节
 
 - **架构**：FastAPI + httpx（异步）+ SQLite（标准库 `sqlite3`，经 `asyncio.to_thread` 调度）
-- **无状态转发**：一次请求建一个上游会话，不跨请求复用，避免不同调用方上下文串扰
-- **真流式**：流式请求经 `asyncio.Queue` 桥接上游 delta，边到边转发；先缓冲开头以剥离回显，轮末丢弃上游重发的整段重复
-- **媒体处理**：上游附件需其自有上传接口签名，无法复现，故带图请求仅传递 URL；生成图片下载至 `data/generated/` 并按 `/media/<id>` 提供
-- **审计**：请求体、响应体、账号、耗时、Token 估算均落库，可按模型/结果筛选，按保留策略自动清理
+- **直连模型 API**：请求转发到官方客户端的模型端点 `/mavis/api/v1/llm/v1/messages`（Anthropic Messages 协议）。结构化 messages、tool use、原生 SSE 流式，无服务端会话、无回显、无重复，上下文由调用方自管
+- **双协议**：`/v1/messages` 原样透传；`/v1/chat/completions` 由 `app/model_api.py` 双向转换（含流式 SSE 的 text / thinking / tool_calls 映射）
+- **无状态转发**：不在服务端维护会话，每个请求独立按账号池路由
+- **媒体处理**：带图请求仅传递 URL；生成图片下载至 `data/generated/` 并按 `/media/<id>` 提供
+- **审计**：账号、耗时、Token 用量均落库，可按模型/结果筛选，按保留策略自动清理
 - **设置热更新**：所有可调参数存于 SQLite 单 JSON 文档，修改即时生效，无需重启
 
 ## 上游协议要点
 
-以下为不可变更项，改动会直接导致请求被拒且上游不指明字段：
+直连模型 API 只需 `Authorization: Bearer <token>`，无需签名。以下为其它不可变更项：
 
-1. **签名算法**：`x-signature = md5(second + 'I*7Cf%WZ#S&%1RlZJ&C2' + body)`；`yy = md5(encodeURIComponent(target) + '_' + body + md5(ms) + 'ooui')`
-2. **查询参数顺序**：agent 22 项、签到 22 项，顺序为签名的一部分，禁止排序
-3. **时钟一致性**：URL 中的 `unix` 与 `yy` 的 `ms` 必须来自同一次读数
-4. **编码差异**：agent 路径用 `encodeURIComponent`（空格 `%20`）；签到路径用 form 编码（空格 `+`）
-5. **签到签名目标**：相对路径，且签名 URL 含 `op_ticket=undefined`，实际发出的请求不含该参数
-6. **准备顺序**：签到前必须先调用 `/config`，否则当天积分不发放
-7. **主机区分**：会话接口位于 `agent-stream.<domain>`，其余接口位于 `agent.<domain>`
-8. **上游回显**：agent 流会先把本轮 `content`（拍平后的 system prompt + 历史）当一帧回吐，再输出真正的回答。网关据此剥离回显（仅当帧内确实包含本次请求的 prompt 时），否则整段 prompt 会被计入回答。该行为在**切换模型**时尤其明显：客户端会带上完整 system prompt 与 skills 清单，回显后 token 迅速冲高。
+1. **路径**：模型端点在 `/mavis/api/v1/llm/v1/messages`（Anthropic Messages 格式）；`/chat/completions` 在该上游不可用（返回 `direct_route_not_configured`）
+2. **鉴权**：仅 Bearer token；`x-mavis-*` 头可选
+3. **签到签名**：签到接口另走 `x-signature` / `yy` 签名（`x-signature = md5(second + 'I*7Cf%WZ#S&%1RlZJ&C2' + body)`），查询参数顺序为签名的一部分
+4. **准备顺序**：签到前必须先调用 `/config`，否则当天积分不发放
 
 ## 测试
 
