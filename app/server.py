@@ -83,6 +83,10 @@ class AppState:
         # The request path's safety net: a token can expire between two sweeps, so
         # the pool renews on a refused credential before retiring the account.
         self.pool.renewer = self.keepalive.renew_account
+        # Same net for check-in: the one-hour token is routinely expired by the
+        # time a scheduled or manual claim runs, and a 401 there is expiry, not a
+        # dead account — renew once, then claim.
+        self.signin.renewer = self.keepalive.renew_account
 
     async def open(self) -> None:
         await self.db.connect()

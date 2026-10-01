@@ -134,6 +134,9 @@ class SigninService:
         self._last_run: dict[str, Any] | None = None
         self._next_run_at: float = 0.0
         self._last_credit_run: dict[str, Any] | None = None
+        # Set by server.py to the keepalive Keeper's renew_account.  Late-bound for
+        # the same reason the pool's is: the keeper is built after this service.
+        self.renewer: Any = None
 
     # --------------------------------------------------------------- lifecycle
 
@@ -339,11 +342,70 @@ class SigninService:
         return run
 
     async def run_account(self, account: Account) -> Outcome:
-        outcome = Outcome(account_id=account.id, account_name=account.name or account.id)
-        if account.region == REGION_CN:
-            outcome.reason = "mainland region, no check-in service"
-            return await _record_outcome(self._db, self._pool, account, outcome)
+        """Check one account in, renewing once if the credential is refused.
 
+        The OAuth access token lives an hour, so the token in hand is routinely
+        already expired when a scheduled or manual check-in runs.  A 401 during the
+        opening sequence used to end the run as a failure the console could still
+        report as "triggered"; one renewal-and-retry turns that ordinary expiry
+        into a normal success.  Only a credential refused *after* a renewal is
+        reported as a real failure.
+        """
+        preflight = Outcome(account_id=account.id, account_name=account.name or account.id)
+        if account.region == REGION_CN:
+            preflight.reason = "mainland region, no check-in service"
+            return await _record_outcome(self._db, self._pool, account, preflight)
+
+        try:
+            return await self._attempt(account)
+        except upstream.InvalidCredential as err:
+            refused = str(err)
+
+        if not await self._renew(account):
+            preflight.status = SIGNIN_FAILED
+            preflight.reason = f"credential refused, not renewable: {refused}"[:300]
+            return await _record_outcome(self._db, self._pool, account, preflight)
+
+        fresh = await self._db.account_by_id(account.id) or account
+        # Put the renewed credential into the pool's cache without reloading: a
+        # reload would rebuild the account objects under the leases the rest of
+        # this run is holding, and leaving the stale token cached is what makes
+        # the next request fail all over again.
+        await self._pool.note_saved(fresh)
+        try:
+            return await self._attempt(fresh)
+        except upstream.InvalidCredential as err:
+            retry = Outcome(account_id=fresh.id, account_name=fresh.name or fresh.id)
+            retry.status = SIGNIN_FAILED
+            retry.reason = f"credential refused even after renewal: {err}"[:300]
+            return await _record_outcome(self._db, self._pool, fresh, retry)
+
+    async def _renew(self, account: Account) -> bool:
+        """Renew one account's credential; report whether it is usable again.
+
+        Deliberately does not reload the pool: a daily run holds leases, and a
+        reload would rebuild the cache under them.  The database is the record —
+        the caller re-reads the account from it and keeps going; the pool's copy
+        converges on the next write or reload.  A token that only ever lives in
+        the pool cache but not in the row is the bug that lets the next request
+        use a dead one again.
+        """
+        if self.renewer is None:
+            return False
+        try:
+            result = await self.renewer(account.id)
+        except Exception:  # noqa: BLE001 - a renewer that raises is "no renewal"
+            return False
+        return bool(result is not None and getattr(result, "ok", False))
+
+    async def _attempt(self, account: Account) -> Outcome:
+        """One check-in pass against a credential presumed usable.
+
+        May raise ``InvalidCredential``; ``run_account`` decides whether that is
+        worth renewing for.  Split out so the retry runs the whole opening sequence
+        again with the fresh token rather than resuming half way through it.
+        """
+        outcome = Outcome(account_id=account.id, account_name=account.name or account.id)
         settings = self._settings_fn().signin
         if settings.skip_zero_credit and account.credit is not None:
             stale = time.time() - account.credit.synced_at > settings.credit_fresh_min * 60

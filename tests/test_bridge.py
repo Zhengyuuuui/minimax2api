@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from app import device_login, gateway, pool, prompt, signing
+from app import device_login, gateway, pool, prompt, signin as signin_mod, signing
 from app.media import MediaStore
 from app.prompt import Turn
 
@@ -1438,3 +1438,171 @@ def test_sweep_only_renews_enabled_accounts():
     assert summary["due"] == 1  # the enabled one only
     # `off` was not even looked at, so it is not in the skipped tally either.
     assert summary["skipped"] == 0
+
+
+# ------------------------------------------------- check-in renews on a 401
+
+
+class _RenewableSigninHarness:
+    """Signin whose upstream answers 401 until the credential is renewed.
+
+    The point of the fake is the *transition*: a stale token is refused on every
+    call, and only after the renewer swaps it does the account work.  That is
+    what a one-hour OAuth token looks like when a claim fires late.
+    """
+
+    def __init__(self, *, renewable=True):
+        from app.records import STATUS_ACTIVE, Account
+
+        self.account = Account(id="a", name="a", enabled=True, status=STATUS_ACTIVE, token="old")
+        self.notes = []
+        self._renewable = renewable
+        self.renew_calls = 0
+        self.client = _StaleUntilRenewedClient(self)
+
+        class _DB:
+            async def save_account_state(_self, account_id, apply_fn):
+                apply_fn(self.account)
+                return self.account
+
+            async def account_by_id(_self, account_id):
+                return self.account
+
+        class _Pool:
+            async def note_saved(_self, account):
+                # Snapshot the token: the point is that the pool is told with the
+                # *renewed* credential, not merely told at all.
+                self.notes.append((account.id, account.token))
+
+        class _Holder:
+            from app.config import SigninSettings
+
+            signin = SigninSettings(timeout_sec=5, gap_seconds=0)
+
+        from app import signin as signin_mod
+
+        self.service = signin_mod.SigninService(_DB(), _Pool(), self.client, lambda: _Holder())
+
+        async def _renewer(account_id):
+            self.renew_calls += 1
+            if not self._renewable:
+                return None
+            self.account.token = "new"
+
+            class _R:
+                ok = True
+
+            return _R()
+
+        self.service.renewer = _renewer
+
+
+class _StaleUntilRenewedClient:
+    """Every authenticated call refuses a token that has not been renewed."""
+
+    def __init__(self, harness):
+        self.harness = harness
+
+    async def credit(self, credential):
+        self._gate(credential)
+        return _CreditInfo()
+
+    async def prepare(self, credential):
+        self._gate(credential)
+
+        class _P:
+            agents = []
+
+            def resolve_agent_id(self, current):
+                return current, False
+
+        return _P()
+
+    async def signin_status(self, credential):
+        self._gate(credential)
+        from app import upstream
+
+        return upstream.SigninPanel(
+            scene=1,
+            days=[upstream.SigninDay(day_no=1, points=800, status=0, is_today=True)],
+        )
+
+    async def signin_claim(self, credential):
+        self._gate(credential)
+        from app import upstream
+
+        return upstream.SigninClaim(claim_id=1, result=1, day_no=1, points=800)
+
+    async def credit_grants(self, credential):
+        import time as _t
+
+        from app import upstream
+
+        return [
+            upstream.CreditGrant(
+                granted_at=int(_t.time() * 1000), expires_at=0, granted=800.0, remaining=800.0
+            )
+        ]
+
+    def _gate(self, credential):
+        from app import upstream
+
+        if credential.token == "old":
+            raise upstream.InvalidCredential("minimax agent list HTTP 401")
+
+
+class _CreditInfo:
+    total = 800.0
+    free = 800.0
+    purchased = 0.0
+    plan_name = ""
+    plan_type = 1
+
+
+def test_checkin_renews_once_and_succeeds_after_a_401():
+    """An expired token is renewed, then the claim runs — not reported as failure."""
+    h = _RenewableSigninHarness()
+    outcome = asyncio.run(h.service.run_account(h.account))
+    assert outcome.status == signin_mod.SIGNIN_OK
+    assert h.renew_calls == 1
+    # The pool cache has to be told, or the next request replays the dead token.
+    assert h.account.token == "new"
+    assert ("a", "new") in h.notes
+
+
+def test_checkin_reports_failure_when_not_renewable():
+    """No renewal path means a real failure, not a silent one."""
+    h = _RenewableSigninHarness(renewable=False)
+    outcome = asyncio.run(h.service.run_account(h.account))
+    assert outcome.status == signin_mod.SIGNIN_FAILED
+    assert "not renewable" in outcome.reason
+
+
+def test_checkin_reports_failure_when_renewed_token_is_still_refused():
+    """A credential refused *after* renewal is the genuine dead-account case."""
+    h = _RenewableSigninHarness()
+
+    async def _fake_renew_but_still_bad(account_id):
+        h.renew_calls += 1
+
+        class _R:
+            ok = True
+
+        return _R()
+
+    # The renewer claims success but leaves the token stale, so the retry 401s.
+    h.service.renewer = _fake_renew_but_still_bad
+    outcome = asyncio.run(h.service.run_account(h.account))
+    assert outcome.status == signin_mod.SIGNIN_FAILED
+    assert "even after renewal" in outcome.reason
+
+
+def test_mainland_account_skips_before_any_credential_check():
+    """A CN account is never renewed for check-in; there is nothing to check into."""
+    h = _RenewableSigninHarness()
+    from app.records import REGION_CN
+
+    h.account.region = REGION_CN
+    outcome = asyncio.run(h.service.run_account(h.account))
+    assert outcome.status == signin_mod.SIGNIN_SKIPPED
+    assert h.renew_calls == 0

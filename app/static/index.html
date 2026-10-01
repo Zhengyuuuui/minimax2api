@@ -1293,15 +1293,27 @@ $("#signin-save").addEventListener("click", async () => {
 });
 
 $("#signin-run").addEventListener("click", async () => {
-  $("#signin-run").disabled = true;
+  const button = $("#signin-run");
+  button.disabled = true;
+  button.textContent = "签到中…";
   try {
-    await api("/admin/api/signin/run", { method: "POST", body: "{}" });
-    flash("已触发一次签到");
+    // The run takes tens of seconds (renewal included), so answer with its
+    // results rather than "triggered": a green flash over failed claims is how
+    // a pool of dead tokens looks healthy.
+    const result = await api("/admin/api/signin/run", { method: "POST", body: "{}" });
+    const c = result.counts || {};
+    const parts = [
+      `成功 ${c.ok || 0}`, `已签 ${c.already || 0}`, `跳过 ${c.skipped || 0}`,
+    ];
+    const bad = (c.failed || 0) + (c.unpaid || 0);
+    const message = parts.join("，") + (bad ? `，失败 ${c.failed || 0}，未发放 ${c.unpaid || 0}` : "");
+    flash(message, bad ? "bad" : "ok");
     await renderSignin();
   } catch (err) {
     flash(err.message, "bad");
   } finally {
-    $("#signin-run").disabled = false;
+    button.disabled = false;
+    button.textContent = "立即运行";
   }
 });
 
