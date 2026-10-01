@@ -351,9 +351,11 @@ class Gateway:
         """
         attempts = max(1, self._settings_fn().routing.max_attempts)
         tried: set[str] = set()
+        renewed: set[str] = set()
         last: BaseException | None = None
+        attempt = 0
 
-        for attempt in range(attempts):
+        while attempt < attempts:
             if attempt:
                 await asyncio.sleep(min(0.25 * attempt, 1.0))
             try:
@@ -371,21 +373,42 @@ class Gateway:
             try:
                 try:
                     response = await self._client.llm(credential, body, stream=stream)
-                except upstream.InvalidCredential:
-                    await self._pool.release(lease, success=False, error=None)
+                except upstream.InvalidCredential as err:
+                    # Hand the refusal to the pool: for an OAuth account it renews
+                    # the token and re-reads the row, so an expired one-hour token
+                    # costs one extra round-trip rather than a failed request.
+                    # The account is only excluded when renewal did not restore
+                    # it, which lets the next iteration retry the same account
+                    # with its fresh token.
+                    await self._pool.release(lease, success=False, error=err)
                     released = True
-                    raise
+                    refreshed = self._pool.account(lease.account.id)
+                    if refreshed is not None and refreshed.status == "active":
+                        # Renewal worked: give the same account one immediate
+                        # retry without spending the attempt budget, so a pool
+                        # configured with a single attempt still recovers.
+                        if lease.account.id not in renewed:
+                            renewed.add(lease.account.id)
+                            continue
+                        tried.add(lease.account.id)
+                    else:
+                        tried.add(lease.account.id)
+                    last = err
+                    attempt += 1
+                    continue
                 except upstream.UpstreamError as err:
                     await self._pool.release(lease, success=False, error=err)
                     released = True
                     tried.add(lease.account.id)
                     last = err
+                    attempt += 1
                     continue
                 except Exception as err:  # noqa: BLE001 - no upstream failure may escape
                     await self._pool.release(lease, success=False, error=err)
                     released = True
                     tried.add(lease.account.id)
                     last = err
+                    attempt += 1
                     continue
 
                 await self._pool.release(lease, success=True)

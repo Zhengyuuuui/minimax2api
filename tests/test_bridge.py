@@ -410,6 +410,60 @@ def test_cancelled_request_returns_its_account_to_the_pool():
     asyncio.run(scenario())
 
 
+def test_expired_token_is_renewed_and_retried_in_place():
+    """A 401 on an OAuth account renews the token and retries the same account.
+
+    The account's own refusal used to be surfaced straight to the caller, so a
+    token that expired mid-flight failed the request even though the renewer
+    could have refreshed it.  The pool now renews on ``InvalidCredential`` and
+    the failover loop retries the same account with the fresh token.
+    """
+    from app import upstream
+    from app.records import KIND_OAUTH, STATUS_ACTIVE
+
+    db, accounts = _fake_pool_db(1)
+    accounts[0].kind = KIND_OAUTH
+    accounts[0].token = "old-token"
+    holder = _SettingsHolder()
+    engine = pool.Pool(db, holder.settings)
+
+    class Renewed:
+        ok = True
+        transient = False
+
+    async def renewer(account_id):
+        # The real renewer rewrites the row and reloads the pool; do both here.
+        for account in accounts:
+            if account.id == account_id:
+                account.token = "new-token"
+                account.status = STATUS_ACTIVE
+        await engine.load()
+        return Renewed()
+
+    engine.renewer = renewer
+
+    async def scenario():
+        await engine.load()
+        calls = []
+
+        class Client:
+            async def llm(self, credential, body, *, stream, timeout=0.0):
+                calls.append(credential.bearer)
+                if credential.bearer == "old-token":
+                    raise upstream.InvalidCredential("expired")
+                return "response"
+
+        bridge = gateway.Gateway(db, engine, Client(), None, holder.settings)
+        trace = gateway.Trace()
+        result = await bridge._run_llm({"model": "x", "messages": []}, trace, stream=False)
+        assert result == "response"
+        # Tried once with the stale token, then once with the refreshed one.
+        assert calls == ["old-token", "new-token"]
+        assert engine.snapshot()[0]["inflight"] == 0
+
+    asyncio.run(scenario())
+
+
 # ------------------------------------------------------------------- fixtures
 
 

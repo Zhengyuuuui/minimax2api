@@ -297,10 +297,13 @@ class Pool:
             slot = self._slots.get(lease.account.id)
             if slot is not None and slot.inflight > 0:
                 slot.inflight -= 1
-            if success:
-                await self._record_success(lease)
-            elif error is not None:
-                await self._record_failure(lease, error)
+        # Bookkeeping runs outside the lock: _record_failure may renew the
+        # credential, and the renewer reloads the pool, which takes the same
+        # lock — re-entering it here would deadlock the request.
+        if success:
+            await self._record_success(lease)
+        elif error is not None:
+            await self._record_failure(lease, error)
 
     async def _record_success(self, lease: Lease) -> None:
         def apply(account: Account) -> None:
