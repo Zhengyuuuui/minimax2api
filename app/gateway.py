@@ -433,7 +433,11 @@ class Gateway:
         Media is fetched here, before the serialisers run, so that a failed
         download leaves the upstream's URL in place rather than an empty link.
         """
-        text = result.text
+        # Belt and braces: a frame-level echo strip already ran while streaming,
+        # but an echo split across frames can only be removed once the whole
+        # answer is assembled.  Both are narrow and leave real answers alone.
+        text = upstream._strip_prompt_echo(result.text, trace.prompt_text)
+        text = upstream._collapse_repeated_tail(text)
         if self._settings_fn().media.auto_download:
             for ref in result.media:
                 item = await self._media.download(

@@ -461,6 +461,53 @@ def _first_deep_string(payload: dict[str, Any], keys: Iterable[str]) -> str:
     return ""
 
 
+def _strip_prompt_echo(text: str, prompt: str) -> str:
+    """Drop the request echoed back inside a content frame.
+
+    Some MiniMax agents replay the whole turn they were given before they
+    answer: one frame carries the ``content`` the bridge just sent, so the
+    flattened system prompt and history come back as if the model had written
+    them.  The reply then contains the entire request, which is both wrong and
+    enormous.
+
+    The check is deliberately narrow, because a false positive would delete a
+    real answer: only a frame that actually carries the sent prompt is touched.
+    A frame that merely mentions it, or a prompt too short to be an echo (a bare
+    ``hi`` is also a plausible reply), is left alone.
+    """
+    if not prompt or not text:
+        return text
+    # A short prompt has no distinctive tail, so an echo cannot be told apart
+    # from a genuine answer and is not stripped.
+    marker = prompt.strip()
+    if len(marker) < 32:
+        return text
+    if marker not in text:
+        return text
+    # Everything up to and including the echo is the request, not the answer.
+    # ``head`` is any text before the echo and ``tail`` any text after it; both
+    # sides can be legitimately non-empty, so both are kept and only the echoed
+    # middle is dropped.
+    head, _, tail = text.partition(marker)
+    return head + tail
+
+
+def _collapse_repeated_tail(text: str) -> str:
+    """Collapse an answer the upstream repeated back-to-back.
+
+    A streamed reply occasionally contains the same sentence twice ("Hi! ... Hi!
+    ...").  Only an exact, whole-string doubling of a reasonably long answer is
+    collapsed, so ordinary repetition inside a real answer survives.
+    """
+    body = text.strip()
+    if len(body) < 16:
+        return text
+    half = len(body) // 2
+    if len(body) % 2 == 0 and body[:half] == body[half:]:
+        return body[:half]
+    return text
+
+
 def _collect_media(payload: Any, media: list[MediaRef]) -> None:
     if isinstance(payload, dict):
         for key, value in payload.items():
@@ -1360,9 +1407,11 @@ class MiniMaxClient:
 
         text = _first_deep_string(payload, CONTENT_KEYS)
         if text:
-            result.text += text
-            if options.on_delta:
-                options.on_delta(text)
+            text = _strip_prompt_echo(text, options.text)
+            if text:
+                result.text += text
+                if options.on_delta:
+                    options.on_delta(text)
 
         _collect_media(payload, result.media)
         stop = _deep_string(payload, "finish_reason")

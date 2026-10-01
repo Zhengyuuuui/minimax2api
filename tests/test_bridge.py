@@ -143,6 +143,46 @@ def test_tool_and_unknown_roles_are_rendered_as_user_turns():
     assert prompt.parse_turn(None) is None
 
 
+# -------------------------------------------------------------- prompt echoes
+
+
+def test_strip_prompt_echo_drops_the_replayed_request():
+    """Some agents replay the whole turn before answering.
+
+    The frame carries the flattened prompt the bridge just sent, so the reply
+    would otherwise contain the entire request — and the request is what makes
+    the token count explode after a model switch.
+    """
+    from app import upstream
+
+    echo = "[系统指令] You are opencode, an interactive CLI tool for coding.\n\n 用户：1. hi"
+    frame = echo + "\nHi! 我是 minimax-m3.1-flash"
+    assert upstream._strip_prompt_echo(frame, echo) == "\nHi! 我是 minimax-m3.1-flash"
+    # Text before and after the echo both survive; only the echoed middle goes.
+    assert upstream._strip_prompt_echo("note|" + echo + "|tail", echo) == "note||tail"
+
+
+def test_strip_prompt_echo_keeps_normal_answers_and_short_prompts():
+    from app import upstream
+
+    long_prompt = "[系统指令] " + "x" * 80
+    # A reply that never contains the prompt is untouched.
+    assert upstream._strip_prompt_echo("你好！", long_prompt) == "你好！"
+    # A short prompt is not distinctive, so an echoing answer is left alone.
+    assert upstream._strip_prompt_echo("hi there!", "hi") == "hi there!"
+
+
+def test_collapse_repeated_tail_only_folds_exact_doubling():
+    from app import upstream
+
+    assert upstream._collapse_repeated_tail("Hi! 我是 minimax-m3.1-flash 👋Hi! 我是 minimax-m3.1-flash 👋") == (
+        "Hi! 我是 minimax-m3.1-flash 👋"
+    )
+    # A real answer that merely repeats a phrase is longer than the fold rule and survives.
+    answer = "这是一个正常长度的回答，包含一些重复的词语，但整体不是整段复制。"
+    assert upstream._collapse_repeated_tail(answer) == answer
+
+
 # ---------------------------------------------------------------------- media
 
 

@@ -4,6 +4,13 @@
 
 ## 📝 更新日志
 
+### 本次更新（剥离上游回显·切换模型不再撑爆上下文）
+
+- **修复：切换模型后响应里出现整段 system prompt / skills，且 token 虚高**。部分 MiniMax Agent 上游会把本轮请求的 `content`（网关拍平的 system prompt + 历史）**原样回显**成一帧，`_handle_frame` 用 `CONTENT_KEYS`（含 `content`）把它当成回答收集。表现是只发一句 `hi`，回复里却带着几十万 token 的 `[系统指令] You are opencode... / <available_skills>...`，`completion_tokens` 虚高到 ~38 万，耗时数十秒。
+- **动态剥离回显（非硬截断）**：新增 `upstream._strip_prompt_echo`，逐帧检测——只有当某帧**确实包含本次请求的 prompt**（≥32 字符且完整匹配）时才剥掉这段回显，前后真实文本都保留；短 prompt（如 `hi`）不具备判别性，不处理，正常回答不受影响。流式时逐帧剥，`gateway._finalize` 组装完成后再用完整 prompt 兜底剥一次（应对跨帧回显）。
+- **折叠重复回答**：`upstream._collapse_repeated_tail` 把上游偶尔整段重复两遍的回答（`Hi!...Hi!...`）折叠为一份；仅对**整段完全翻倍**且 ≥16 字符生效，真实回答内的正常重复不受影响。
+- 新增 3 个回归测试覆盖以上行为。
+
 ### 本次更新（模型选择 · 上新 M3.1 Flash）
 
 - **接入真实模型选择**：`ModelConfig.upstream_model` / `variant` 现在会转换为上游的 `model` 选择对象 `{"model_id", "provider_id": "minimax", "variant"}`（此前从未发送，所有请求都用账号默认模型）。上游拒绝裸字符串，必须是对象。
@@ -350,6 +357,7 @@ cp .env.example .env   # 模板，逐项有注释
 5. **签到签名目标**：相对路径，且签名 URL 含 `op_ticket=undefined`，实际发出的请求不含该参数
 6. **准备顺序**：签到前必须先调用 `/config`，否则当天积分不发放
 7. **主机区分**：会话接口位于 `agent-stream.<domain>`，其余接口位于 `agent.<domain>`
+8. **上游回显**：agent 流会先把本轮 `content`（拍平后的 system prompt + 历史）当一帧回吐，再输出真正的回答。网关据此剥离回显（仅当帧内确实包含本次请求的 prompt 时），否则整段 prompt 会被计入回答。该行为在**切换模型**时尤其明显：客户端会带上完整 system prompt 与 skills 清单，回显后 token 迅速冲高。
 
 ## 测试
 
@@ -357,7 +365,7 @@ cp .env.example .env   # 模板，逐项有注释
 python -m pytest tests/
 ```
 
-覆盖签名配方、prompt 整形、账号池状态机、凭据类型分派（查询参数 vs Bearer）、媒体路径安全、代理池解析/选择、环境变量覆盖与密钥脱敏。
+覆盖签名配方、prompt 整形、上游回显剥离与重复回答折叠、账号池状态机、凭据类型分派（查询参数 vs Bearer）、媒体路径安全、代理池解析/选择、环境变量覆盖与密钥脱敏。
 
 ## 二开：自行添加鉴权
 
