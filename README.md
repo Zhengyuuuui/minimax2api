@@ -4,6 +4,15 @@
 
 ## 📝 更新日志
 
+### 本次更新（注册改为「有头浏览器过滑块」——上游已无法纯无头注册）
+
+- **⚠️ 上游注册政策变更**：MiniMax 账号服务在发邮箱验证码前新增了**腾讯 TCaptcha 滑块人机验证**（`1200063 人机验证未通过`）。此前把验证码编译关闭（`h.Xy=false`）的窗口已经关闭，**纯 HTTP 无头注册不再可行**：滑块票据（`randStr` / `ticket`）由腾讯 SDK 在真实页面里生成，行为负载无法在协议层伪造。
+- **改为有头浏览器注册**：注册时借操作者本机 Chrome（CDP 远程调试）过滑块。分两半——
+  - **浏览器**负责：填邮箱 → 继续 → **自动输入密码** → 继续 → **自动过滑块**（滑块渲染在跨域 OOPIF `turing.captcha.gtimg.com` 内，用 OpenCV 融合检测定位缺口 + 可信 CDP 拟人拖动）→ 页面自己发出验证码；
+  - **HTTP** 负责：读邮箱取码 → `POST /oauth2/login`（`loginType=20`，RSA 密码 + 验证码一次完成验证与设密）→ 设备码换 OAuth token → 入池 → 自动签到。
+- **标签页生命周期**：过滑块后页面**不立即关闭**（页面自己发的发码请求还在飞行中，关页会打断发码）；一个注册批次内**复用同一标签页**，批次结束且无待注册任务时才关闭。
+- **需要带有头滑块注册的版本，请联系邮箱：`tmpyunex@yunex.ccwu.cc`**（此功能不随本仓库开源）。
+
 ### 本次更新（改用官方直连模型 API，彻底告别黑盒 Agent 的 echo / 卡顿 / 上下文爆炸）
 
 - **重大变更：上游从「Agent 会话接口」切换为「直连模型 API」**。此前请求的是 MiniMax Code 的 Agent 会话端点（`/minimax-cloud/api/v1/session/{id}/message`，单段 `content` 字符串），那是一条黑盒链路：会把整轮 prompt 原样回显、把回答重复两遍、每轮全量重发上下文，切换模型后单请求可达 38 万 token、首字节迟滞数十秒。现改为官方客户端真正使用的直连模型端点：
@@ -84,6 +93,7 @@
 
 - **多账号池**：每个账号是一份登录凭据（JWT 或 OAuth access token），按策略调度、故障转移、健康冷却
 - **浏览器一键登录**：OAuth2 设备码流程（PKCE S256），点按钮跳转官方授权页，登录完成后账号自动入池，无需手动复制 `_token`
+- **有头浏览器注册**：借本机 Chrome 过腾讯滑块、自动填邮箱与密码，HTTP 侧完成验证/设密/设备码授权，一键造号入池（详见「方式 C」）
 - **协议转换**：OpenAI Chat Completions + Anthropic Messages，支持流式（SSE）
 - **媒体本地化**：上游生成的图片 URL 几小时后过期，自动下载到本地并按 `/media/<id>` 提供
 - **每日签到**：多账号自动签到、积分核查、大陆区账号自动跳过；注册成功自动签一次，其余可在控制台手动签到
@@ -102,7 +112,7 @@ minimaxcode2api/
 │   ├── gateway.py         # OpenAI / Anthropic 协议转换与故障转移
 │   ├── pool.py            # 账号池调度、冷却与健康状态机
 │   ├── device_login.py    # OAuth2 设备码登录流程
-│   ├── signup.py          # 无头注册（邮箱验证码 + 自动设备码授权）
+│   ├── signup.py          # 注册（有头浏览器过滑块 + HTTP 完成验证与设密）
 │   ├── proxy.py           # 代理池：解析 / 检测 / 轮换
 │   ├── env.py             # 环境变量覆盖与 .env 读取
 │   ├── signin.py          # 每日签到与积分核查
@@ -165,20 +175,51 @@ python run.py --port 4555
 
 > **网络要求**：海外版业务接口锁海外出口，本机不在海外时请先在「设置」中填写 `proxy`，否则探测必定 401；国内版直连即可。该设置只影响代理，账号服务本身可直连。回环地址自动绕过代理。
 
-**方式 C：无头注册（自动造号入池）**
+**方式 C：有头浏览器注册（自动过滑块 + 自动注册入池）**
 
-控制台「号池」→「无头注册」→ 选区域 / 数量 /（可选）初始密码 →「开始注册」。全程无浏览器：
+> **⚠️ 上游注册政策已变更**：MiniMax 账号服务在发送邮箱验证码前新增了**腾讯 TCaptcha 滑块验证**。旧版「纯无头注册」依赖该验证码被编译关闭，现已失效——发码接口对无票据请求直接返回 `1200063 人机验证未通过`。slider 的票据由腾讯 SDK 在真实页面里生成，协议层无法伪造，**因此注册必须借助有头浏览器过滑块**。
+>
+> **需要带有头滑块注册功能的版本，请联系邮箱：`tmpyunex@yunex.ccwu.cc`**（此功能不随本仓库开源）。
 
-1. 向临时邮箱服务要一个地址（`signup.mail_base` / `mail_domain` / `mail_pass`）；
-2. `POST /v1/api/user/login/sms/send` 取邮箱验证码；
-3. `POST /oauth2/login`（`loginType=21`）验证即注册，拿到 `_sid` 会话；
-4. **设置密码**：默认使用 `signup.password`（默认 `Minimax2026!`），注册面板填了则以面板为准。这一步需要**第二封邮件验证码**（注册那封已被消耗），通常比前面慢；
-5. 服务端用该会话走**设备码流程**（`/oauth2/device/code` → `GET/POST /oauth2/device/authorize` → `/oauth2/token`）换出 OAuth `access_token` + `refresh_token`；
-6. 交给现有 `import_device_token` 入池，并**自动签到一次**领取首日额度。
+控制台「号池」→「有头注册」→ 选区域 / 数量 /（可选）初始密码 →「开始注册」。程序会打开本机 Chrome（CDP）完成浏览器侧动作，再回落到 HTTP 完成注册：
 
-> 该 build 的腾讯验证码被编译关闭（`h.Xy=false`），故发码无需验证码；`cn` 区 build 会拉起验证码，是另一条路。
+1. **浏览器**：打开 `account.minimax.io/unified-login` → 填邮箱 → 继续 → **自动输入密码** → 继续 → **自动拖动滑块过验证**（滑块在跨域 iframe 内，用 OpenCV 定位缺口 + 拟人轨迹拖动）；
+2. 过滑块后，**页面自身**发出 `POST /v1/api/user/login/sms/send`（携带 `randStr` / `ticket`），验证码进入临时邮箱；
+3. **HTTP**：读邮箱取码 → `POST /oauth2/login`（`loginType=20`，RSA 加密密码 + 验证码）**一步完成验证并设密**，拿到 `_sid`；
+4. 服务端以该会话走**设备码流程**换出 OAuth `access_token` + `refresh_token`；
+5. 交给 `import_device_token` **入池**，并**自动签到一次**领取首日额度；
+6. 一个批次内**复用同一标签页**；批次结束且无待注册任务时**自动关闭**标签页。
 
-> **密码步骤可跳过**：把 `signup.password` 设为空、且注册面板留空，则不设密码；账号仍有 refresh_token 可续期，但没有密码就无法在控制台用密码重登。
+**准备浏览器**（首次使用）：
+
+```bash
+# 用独立 profile + 专用端口启动 Chrome，并挂上代理（国际站资源需海外出口）
+open -na "Google Chrome" --args \
+  --user-data-dir="$HOME/chrome9367-clean" \
+  --remote-debugging-port=9367 \
+  --remote-allow-origins=http://localhost:9367,http://127.0.0.1:9367 \
+  --proxy-server="http://127.0.0.1:7890" \
+  --no-first-run --no-default-browser-check \
+  "https://account.minimax.io/unified-login"
+```
+
+> 也可直接用仓库脚本：`./scripts/start_chrome_9367.sh`。
+> **代理参数是必需的**：不带 `--proxy-server` 时验证码资源 `turing.captcha.gtimg.com` 会加载失败，滑块出不来。
+> 设置里 `signup.cdp_port` 要与该端口（如 `9367`）一致。
+
+**流程截图：**
+
+| 自动输入密码 | 自动过滑块 |
+| --- | --- |
+| ![自动输入密码](./img/截屏2026-10-03%2008.41.13.jpg) | ![自动过滑块](./img/截屏2026-10-03%2008.41.09.jpg) |
+
+| 账号入池 | 遇到封控 |
+| --- | --- |
+| ![账号入池](./img/截屏2026-10-03%2008.41.40.jpg) | ![遇到封控](./img/截屏2026-10-02%2021.51.22.jpg) |
+
+> **遇到封控（上表右下）**：出现「操作过于频繁（operation too often，please retry later）」等提示时，说明当前**出口 IP 已被风控**。此时需要**切换出口 IP**（换代理 / 换网络），并建议使用**指纹浏览器 / 独立干净的浏览器 profile** 隔离环境，再重试。
+
+> **密码步骤**：默认使用 `signup.password`（默认 `Minimax2026!`），注册面板填了则以面板为准。验证码 `loginType=20` 同时完成验证与设密，**无需第二封邮件**。
 
 **方式 D：邮箱密码批量导入**
 
@@ -197,19 +238,26 @@ python run.py --port 4555
 - **批量节流**：`signup.batch_max` 限制单批数量，`signup.gap_seconds` 给账号之间留间隔（串行注册，避免瞬时爆发特征）。
 - 同一次注册的邮箱调用与账号调用**共用同一代理**，出口地址可归因。
 
-### 排错：注册卡在 “setting password”，或提示 code 32 / 邮箱错误
+### 排错：注册卡住，或提示封控 / 邮箱错误
 
-**现象**：控制台注册长时间停在 `setting password`（可达 2–3 分钟）。
+**现象 A：提示「operation too often, please retry later」等操作频繁。**
 
-**原因**：设置密码需要**第二封邮箱验证码**，而账号服务的发码接口按地址限流。被限流时返回 `code 32`，此时邮件往往**已经发出**，程序会继续等待并重试（最多 3 次、每次间隔 20 秒，总时长受 `signup.mail_timeout_sec` 约束）。所以“卡住”多半是在等邮件，不是死锁——也可能最终成功。
+**原因**：注册按**出口 IP** 被风控计数，同一地址短时间注册多次会被限流，甚至滑块验证也过不去。
 
-**怎么解决/缓解**：
-1. **换出口地址**：限流是**按 IP** 的。配上**代理池**（`use_proxies=true` + 多个代理），每个号走不同出口，可显著降低同一地址的发码频率。单个地址注册太密必然触发。
-2. **放慢批量**：调大 `signup.gap_seconds`（账号间隔），降低 `signup.batch_max`（单批数量），不要短时间内连造。
-3. **拉长等待**：网络/邮件服务慢时把 `signup.mail_timeout_sec` 调大（最小 10），并确认 `mail_poll_sec` 不太大。
-4. **确认邮箱服务本身可用**：`mail_base` / `mail_domain` / `mail_pass` 三项要匹配你的临时邮箱 worker；passkey 错误会返回 `AUTH_ADMIN_CREDENTIAL_INVALID`（现在会给出明确中文提示）。可用“全部探测/余额”之外的方式先验证 worker 能建地址。
-5. **不需要密码就跳过**：若只是要能用的号（有 refresh_token 即可续期），把 `signup.password` 留空、注册面板也留空，即跳过整个设密码步骤，注册会快很多。
-6. **代理与本机出口**：国际站业务接口锁海外出口。没配代理池时注册走 `upstream.proxy`（未填则直连）；直连且本机在国内会失败或极易被风控。
+**怎么解决**：
+1. **切换出口 IP**：换代理 / 换网络出口（国际站业务与验证码资源都锁海外出口）。
+2. **指纹浏览 / 独立环境**：使用指纹浏览器，或至少保证 `--user-data-dir` 是**独立干净**的 profile（不要与日常浏览器混用），减少环境特征关联。
+3. **放慢批量**：调大 `signup.gap_seconds`、降低 `signup.batch_max`。
+
+**现象 B：控制台注册长时间停在某一步。**
+
+**原因**：注册要等待邮件验证码（可达两分钟），且滑块 + 邮件都受网络/风控影响，多半是在等待，不是死锁。
+
+**怎么解决**：
+1. **确认浏览器可用**：`signup.cdp_port` 对应的 Chrome 必须开着、且带 `--proxy-server`（否则验证码资源加载失败，滑块出不来，报 `chrome not reachable` 或 `captcha never became ready`）。
+2. **确认邮箱服务本身可用**：`mail_base` / `mail_domain` / `mail_pass` 三项要匹配你的临时邮箱 worker；passkey 错误会返回 `AUTH_ADMIN_CREDENTIAL_INVALID`（会给出明确中文提示）。
+3. **拉长等待**：邮件服务慢时把 `signup.mail_timeout_sec` 调大（最小 10），并确认 `mail_poll_sec` 不太大。
+4. **代理与出口**：国际站业务接口锁海外出口；没配代理池时注册走 `upstream.proxy`（未填则直连），直连且本机在国内会失败或极易被风控。
 
 ### 2. 调用
 
