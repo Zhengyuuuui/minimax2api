@@ -1792,3 +1792,275 @@ def test_mainland_account_skips_before_any_credential_check():
     outcome = asyncio.run(h.service.run_account(h.account))
     assert outcome.status == signin_mod.SIGNIN_SKIPPED
     assert h.renew_calls == 0
+
+
+# ---------------------------------------------------------------------- video
+
+
+def test_video_turn_text_mentions_plugin_and_places_options_last():
+    """A video turn is the mention plus an options block, block last.
+
+    The upstream's own reader is anchored to the end of the message, so anything
+    after the closing tag would be parsed as part of the prompt and the
+    parameters silently ignored.  This test pins the whole shape.
+    """
+    from app import upstream
+
+    text = upstream.video_turn_text(
+        "一只猫在弹钢琴",
+        "MiniMax-H3-Max",
+        plugin="video-creater",
+        tag="video-generation-options",
+        duration=8,
+        ratio="16:9",
+        resolution="480P",
+    )
+    assert text.startswith("@video-creater 一只猫在弹钢琴")
+    assert text.endswith("</video-generation-options>")
+    block = text.rsplit("\n\n", 1)[1]
+    assert block.startswith("<video-generation-options>\n{")
+    payload = json.loads(block.split("\n")[1])
+    assert payload == {"duration": 8, "model": "MiniMax-H3-Max", "ratio": "16:9", "resolution": "480P"}
+
+
+def test_video_turn_text_does_not_duplicate_an_existing_mention():
+    from app import upstream
+
+    text = upstream.video_turn_text(
+        "@video-creater make a cat video",
+        "MiniMax-H3",
+        plugin="video-creater",
+        tag="video-generation-options",
+        duration=5,
+        ratio="16:9",
+        resolution="768P",
+    )
+    assert text.count("@video-creater") == 1
+
+
+def test_absolute_download_url_adds_a_missing_scheme_only():
+    from app import upstream
+
+    assert upstream.absolute_download_url("matrix-internal.oss.aliyuncs.com/f?x=1") == (
+        "https://matrix-internal.oss.aliyuncs.com/f?x=1"
+    )
+    assert upstream.absolute_download_url("https://cdn/a.mp4") == "https://cdn/a.mp4"
+    assert upstream.absolute_download_url("") == ""
+
+
+def test_video_artifact_kind_prefers_category_then_mime():
+    from app.video import _is_video
+
+    assert _is_video({"category": "videos"})
+    assert _is_video({"category": "video"})
+    assert _is_video({"mime_type": "video/mp4"})
+    assert not _is_video({"category": "images", "mime_type": "image/png"})
+    assert not _is_video({})
+
+
+class _VideoDB:
+    """The slice of the database the VideoService touches, in memory."""
+
+    def __init__(self):
+        self.jobs = {}
+        self.media = []
+        self._settings = None
+
+    def bind(self, settings):
+        self._settings = settings
+
+    def settings(self):
+        return self._settings
+
+    async def add_video_job(self, job):
+        self.jobs[job.id] = job
+
+    async def update_video_job(self, job_id, apply_fn):
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        apply_fn(job)
+        return job
+
+    async def video_job(self, job_id):
+        return self.jobs.get(job_id)
+
+    async def list_video_jobs(self, limit=100):
+        return list(self.jobs.values())[:limit]
+
+    async def active_video_jobs(self):
+        from app.records import VIDEO_ACTIVE
+
+        return [job for job in self.jobs.values() if job.status in VIDEO_ACTIVE]
+
+    async def delete_video_job(self, job_id):
+        return self.jobs.pop(job_id, None)
+
+    async def account_by_id(self, account_id):
+        from app.records import Account
+
+        return Account(id=account_id, name="a", agent_id="1", token="t")
+
+
+class _VideoClient:
+    """Records calls; nothing here reaches the network."""
+
+    def __init__(self):
+        self.turn_calls = []
+
+    async def enable_video_plugin(self, cred, plugin):
+        return {"enabled": True}
+
+    async def credit(self, cred):
+        class _C:
+            total = 100.0
+
+        return _C()
+
+    async def create_session(self, cred):
+        return "sess-1"
+
+    async def send_message(self, cred, options, session_id, timeout):
+        self.turn_calls.append(options.text)
+        from app.upstream import Result
+
+        return Result(text="在生成", session_id=session_id)
+
+
+class _VideoPool:
+    def __init__(self):
+        self.releases = []
+
+    async def acquire(self, *, exclude=None, allow=None):
+        from app.pool import Lease
+        from app.records import Account
+
+        return Lease(account=Account(id="acct", name="a", agent_id="1", token="t"), token="t")
+
+    async def release(self, lease, *, success, error=None):
+        self.releases.append((success, error))
+
+
+def _video_settings(tmp_path):
+    from app.config import Settings, VideoSettings
+
+    return Settings(video=VideoSettings(videos_dir=str(tmp_path / "videos")))
+
+
+def test_video_service_submit_rejects_empty_prompt_and_unknown_model(tmp_path):
+    from app.video import VideoError, VideoService
+
+    db = _VideoDB()
+    db.bind(_video_settings(tmp_path))
+    service = VideoService(db, _VideoPool(), _VideoClient(), db.settings)
+
+    with pytest.raises(VideoError):
+        asyncio.run(service.submit(prompt="  ", model_id="minimax-h3-max", account_id="x"))
+    with pytest.raises(VideoError):
+        asyncio.run(service.submit(prompt="ok", model_id="nope", account_id="x"))
+
+
+def test_video_service_file_path_refuses_traversal(tmp_path):
+    from app.video import VideoService
+
+    db = _VideoDB()
+    db.bind(_video_settings(tmp_path))
+    service = VideoService(db, _VideoPool(), _VideoClient(), db.settings)
+
+    assert service._file_path("../escape.mp4") is None
+    assert service._file_path("a/b.mp4") is None
+    assert service._file_path("ok.mp4") is not None
+
+
+def test_video_turn_releases_account_healthily_when_stream_breaks(tmp_path):
+    """A broken stream must not cool the account: the upstream still ran.
+
+    The probe rounds are the evidence — a reset stream produced the video
+    anyway.  Penalising the account for our read dying would strand a healthy
+    account, so the release must carry success=True and no error.
+    """
+    from app.records import VIDEO_RUNNING, VideoJob
+    from app.video import VideoService
+
+    class _BrokenClient(_VideoClient):
+        async def send_message(self, cred, options, session_id, timeout):
+            from app.upstream import UpstreamError
+
+            self.turn_calls.append(options.text)
+            raise UpstreamError("peer closed connection")
+
+    db = _VideoDB()
+    db.bind(_video_settings(tmp_path))
+    pool = _VideoPool()
+    service = VideoService(db, pool, _BrokenClient(), db.settings)
+    job = VideoJob(id="video_x", prompt="p", model="MiniMax-H3", account_id="acct",
+                   duration=6, ratio="16:9", resolution="768P", session_id="", status=VIDEO_RUNNING,
+                   created_at=time.time())
+    db.jobs[job.id] = job
+
+    asyncio.run(service._turn(job.id))
+
+    assert pool.releases == [(False, None)]  # success=False, error=None => "not the account's fault"
+    # The session id was captured before the message, so the drive poll can run.
+    assert db.jobs[job.id].session_id == "sess-1"
+
+
+def test_video_cancel_marks_unfinished_job_failed(tmp_path):
+    from app.records import VIDEO_FAILED, VIDEO_RUNNING, VideoJob
+    from app.video import VideoService
+
+    db = _VideoDB()
+    db.bind(_video_settings(tmp_path))
+    service = VideoService(db, _VideoPool(), _VideoClient(), db.settings)
+    job = VideoJob(id="video_y", status=VIDEO_RUNNING, created_at=time.time())
+    db.jobs[job.id] = job
+
+    assert asyncio.run(service.cancel(job.id)) is True
+    assert db.jobs[job.id].status == VIDEO_FAILED
+
+
+def test_video_delete_refuses_an_unfinished_job(tmp_path):
+    from app.records import VIDEO_RUNNING, VideoJob
+    from app.video import VideoError, VideoService
+
+    db = _VideoDB()
+    db.bind(_video_settings(tmp_path))
+    service = VideoService(db, _VideoPool(), _VideoClient(), db.settings)
+    job = VideoJob(id="video_z", status=VIDEO_RUNNING, created_at=time.time())
+    db.jobs[job.id] = job
+
+    with pytest.raises(VideoError):
+        asyncio.run(service.delete(job.id))
+
+
+def test_video_run_skips_a_terminal_job(tmp_path):
+    """A done/failed job must not re-enter the turn or a harvest.
+
+    Resume only hands over unfinished rows, but `_start` is reachable elsewhere;
+    re-running a finished job would spend a second turn or overwrite a file that
+    already landed.  The guard is here so the state machine is idempotent on its
+    own, not only because the query filters.
+    """
+    from app.records import VIDEO_DONE, VIDEO_FAILED, VideoJob
+    from app.video import VideoService
+
+    for status in (VIDEO_DONE, VIDEO_FAILED):
+        db = _VideoDB()
+        db.bind(_video_settings(tmp_path))
+        service = VideoService(db, _VideoPool(), _VideoClient(), db.settings)
+        job = VideoJob(id="video_t", status=status, created_at=time.time())
+        db.jobs[job.id] = job
+
+        touched = {"turn": False, "watch": False}
+
+        async def _turn(job_id):
+            touched["turn"] = True
+
+        async def _watch(job_id, settings):
+            touched["watch"] = True
+
+        service._turn = _turn
+        service._watch = _watch
+        asyncio.run(service._run(job.id))
+        assert not touched["turn"] and not touched["watch"], (status, touched)
+

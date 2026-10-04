@@ -121,6 +121,7 @@
     <button data-view="signin">签到</button>
     <button data-view="audits">审计</button>
     <button data-view="media">画廊</button>
+    <button data-view="videos">视频</button>
     <button data-view="settings">设置</button>
   </nav>
   <span class="spacer"></span>
@@ -318,6 +319,40 @@ b@example.com----Password456"></textarea>
     </div>
   </section>
 
+  <section id="view-videos" hidden>
+    <div class="panel">
+      <h2>提交视频任务</h2>
+      <p class="muted" style="margin-top:0">视频走的是账号积分、不是 Token Plan（Hailuo 除外），一轮从提交到出片可能要十几分钟。任务在后台轮询网盘，刷新或重开本页不影响进度。</p>
+      <div class="row">
+        <div style="flex:1;min-width:260px"><label>提示词</label><textarea id="video-prompt" placeholder="例如：一艘红色小纸船漂过雨后积水的街道，镜头缓慢跟随"></textarea></div>
+      </div>
+      <div class="row">
+        <div><label>模型</label><select id="video-model"></select></div>
+        <div><label>账号</label><select id="video-account"></select></div>
+        <div style="flex:0 0 auto"><label>时长（秒）</label><input id="video-duration" type="number" min="1" max="15" value="6" style="width:80px"></div>
+        <div style="flex:0 0 auto"><label>画幅</label><select id="video-ratio">
+          <option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
+        </select></div>
+        <div style="flex:0 0 auto"><label>分辨率</label><select id="video-resolution">
+          <option value="768P">768P</option><option value="480P">480P</option><option value="1080P">1080P</option>
+        </select></div>
+        <div style="flex:0 0 auto;align-self:flex-end"><button id="video-submit">提交</button></div>
+      </div>
+      <p class="muted" style="font-size:12px;margin:6px 0 0" id="video-model-note"></p>
+    </div>
+    <div class="panel">
+      <h2>任务列表 <span id="video-count" class="muted"></span></h2>
+      <table>
+        <thead><tr><th>提交</th><th>模型</th><th>提示词</th><th>参数</th><th>状态</th><th>积分</th><th>成品</th><th></th></tr></thead>
+        <tbody id="videos-body"></tbody>
+      </table>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:0 0 auto"><button id="video-refresh" class="ghost">刷新</button></div>
+        <div class="muted" style="align-self:center" id="video-hint"></div>
+      </div>
+    </div>
+  </section>
+
   <section id="view-settings" hidden>
     <div class="panel">
       <h2>运行设置</h2>
@@ -342,6 +377,7 @@ const state = {
   view: "accounts",
   audits: { offset: 0, limit: 50, total: 0, model: "", outcome: "" },
   accounts: [],
+  videoModels: [],
 };
 
 function flash(message, kind = "ok") {
@@ -520,6 +556,7 @@ async function render() {
     if (state.view === "signin") return await renderSignin();
     if (state.view === "audits") return await renderAudits();
     if (state.view === "media") return await renderMedia();
+    if (state.view === "videos") return await renderVideos();
     if (state.view === "settings") return await renderSettings();
   } catch (err) {
     flash(err.message, "bad");
@@ -676,6 +713,107 @@ async function renderMedia() {
     </div>`).join("") || '<p class="muted">还没有素材。</p>';
 }
 
+/* -------------------------------------------------------------------- videos */
+
+const VIDEO_STATUS = {
+  queued: ["排队中", "warn"],
+  running: ["提交中", "warn"],
+  rendering: ["生成中", "warn"],
+  downloading: ["下载中", "warn"],
+  done: ["已完成", "ok"],
+  failed: ["失败", "bad"],
+};
+
+let videoTimer = null;
+
+function videoStatusPill(status) {
+  const [label, kind] = VIDEO_STATUS[status] || [status, ""];
+  return pill(label, kind);
+}
+
+function videoCreditCell(job) {
+  if (job.creditSpent != null) {
+    return `<span title="提交前 ${job.creditBefore} / 完成后 ${job.creditAfter}">-${job.creditSpent}</span>`;
+  }
+  return `<span class="muted">-</span>`;
+}
+
+function videoResultCell(job) {
+  if (job.status === "done") {
+    return `<a href="/admin/api/videos/${job.id}/file" target="_blank" rel="noopener">播放/下载</a>` +
+      `<br><span class="tiny muted">${Math.round((job.fileSize || 0) / 1024)} KB</span>`;
+  }
+  if (job.status === "failed") {
+    const note = (job.error || "").slice(0, 40);
+    return `<span class="tiny muted" title="${(job.error || "") + (job.detail ? "｜" + job.detail : "")}">${note || "无产物"}</span>`;
+  }
+  return `<span class="muted">…</span>`;
+}
+
+async function renderVideos() {
+  const jobs = await api("/admin/api/videos");
+  // Models and accounts populate the submit form's selects; both come from
+  // caches that already exist, so a visit to this page costs no upstream call.
+  const models = await api("/admin/api/videos/models");
+  if (!state.accounts.length) state.accounts = await api("/admin/api/accounts");
+  const modelSelect = $("#video-model");
+  const accountSelect = $("#video-account");
+  if (!modelSelect.options.length) {
+    modelSelect.innerHTML = models.map((model) =>
+      `<option value="${model.id}">${model.name}</option>`).join("");
+  }
+  if (!accountSelect.options.length) {
+    accountSelect.innerHTML = state.accounts
+      .filter((account) => account.enabled && account.agentID)
+      .map((account) => {
+        const credit = account.credit ? account.credit.total : "?";
+        const name = account.name || account.id.slice(0, 8);
+        return `<option value="${account.id}">${name}（${credit}分）</option>`;
+      }).join("");
+  }
+  videoModelNote(models);
+  const running = jobs.filter((job) => !["done", "failed"].includes(job.status)).length;
+  $("#video-count").textContent = `(${jobs.length})`;
+  $("#videos-body").innerHTML = jobs.map((job) => row([
+    timeAgo(job.createdAt),
+    `<code>${job.model}</code>`,
+    `<span title="${job.prompt}">${(job.prompt || "").slice(0, 24)}${(job.prompt || "").length > 24 ? "…" : ""}</span>`,
+    `<span class="muted">${job.duration}s ${job.ratio} ${job.resolution}</span>`,
+    videoStatusPill(job.status),
+    videoCreditCell(job),
+    videoResultCell(job),
+    [
+      running && !["done", "failed"].includes(job.status)
+        ? `<button class="ghost small" data-video-act="cancel" data-id="${job.id}">取消</button>`
+        : "",
+      ["done", "failed"].includes(job.status)
+        ? `<button class="danger small" data-video-act="delete" data-id="${job.id}">删除</button>`
+        : "",
+    ].join(" "),
+  ])).join("") || row(['<td colspan="8" class="muted">还没有视频任务。</td>']);
+
+  // Keep the page fresh while anything is running, and stop the moment it is
+  // not: a finished video will not change again, and polling a settled list
+  // forever is exactly the kind of background traffic the probe phase showed
+  // the egress does not forgive.
+  if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
+  if (running) {
+    videoTimer = setInterval(() => {
+      if (state.view === "videos") renderVideos().catch(() => {});
+      else { clearInterval(videoTimer); videoTimer = null; }
+    }, 8000);
+  }
+}
+
+function videoModelNote(models) {
+  const list = models || state.videoModels || [];
+  state.videoModels = list;
+  const model = list.find((item) => item.id === $("#video-model").value);
+  $("#video-model-note").textContent = model ? model.note : "";
+}
+
+$("#video-model").addEventListener("change", () => videoModelNote());
+
 const SETTING_LABELS = {
   "upstream.base_url": "国际区 base_url",
   "upstream.base_url_cn": "大陆区 base_url",
@@ -710,6 +848,12 @@ const SETTING_LABELS = {
   "signup.gap_seconds": "批量注册间隔（秒）",
   "keepalive.enabled": "启用 Token 保活",
   "keepalive.interval_sec": "保活巡检间隔（秒）",
+  "video.default_duration": "视频默认时长（秒）",
+  "video.default_ratio": "视频默认画幅",
+  "video.default_resolution": "视频默认分辨率",
+  "video.poll_timeout_sec": "视频轮询超时（秒）",
+  "video.max_concurrent": "视频并发上限",
+  "video.auto_enable_plugin": "提交前自动启用视频插件",
 };
 
 async function renderSettings() {
@@ -1400,6 +1544,51 @@ $("#audit-next").addEventListener("click", () => {
   if (state.audits.offset + state.audits.limit >= state.audits.total) return;
   state.audits.offset += state.audits.limit;
   renderAudits();
+});
+
+$("#video-submit").addEventListener("click", async () => {
+  const button = $("#video-submit");
+  if (!$("#video-prompt").value.trim()) { flash("请填写提示词", "bad"); return; }
+  if (!$("#video-account").value) { flash("没有可用账号（需启用且有 agentID）", "bad"); return; }
+  button.disabled = true;
+  button.textContent = "提交中…";
+  try {
+    await api("/admin/api/videos", { method: "POST", body: JSON.stringify({
+      prompt: $("#video-prompt").value.trim(),
+      model: $("#video-model").value,
+      accountId: $("#video-account").value,
+      duration: Number($("#video-duration").value) || 0,
+      ratio: $("#video-ratio").value,
+      resolution: $("#video-resolution").value,
+    }) });
+    flash("任务已提交，后台生成中");
+    await renderVideos();
+  } catch (err) {
+    flash(err.message, "bad");
+  } finally {
+    button.disabled = false;
+    button.textContent = "提交";
+  }
+});
+
+$("#video-refresh").addEventListener("click", () => { renderVideos().catch((err) => flash(err.message, "bad")); });
+
+$("#videos-body").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-video-act]");
+  if (!button) return;
+  const { videoAct: act, id } = button.dataset;
+  try {
+    if (act === "cancel") {
+      if (!confirm("取消该任务？上游若已受理，积分不会退回。")) return;
+      await api(`/admin/api/videos/${id}/cancel`, { method: "POST", body: "{}" });
+    } else if (act === "delete") {
+      if (!confirm("删除任务记录与成品文件？")) return;
+      await api(`/admin/api/videos/${id}`, { method: "DELETE" });
+    }
+    await renderVideos();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
 });
 
 /* -------------------------------------------------------------------- start */

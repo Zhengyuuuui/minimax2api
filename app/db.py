@@ -32,6 +32,7 @@ from .records import (
     Proxy,
     Quota,
     SigninPanel,
+    VideoJob,
     dumps,
     iso,
     loads_or_none,
@@ -146,6 +147,29 @@ CREATE TABLE IF NOT EXISTS media (
 );
 CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at);
 
+CREATE TABLE IF NOT EXISTS video_jobs (
+    id           TEXT PRIMARY KEY,
+    prompt       TEXT NOT NULL DEFAULT '',
+    model        TEXT NOT NULL DEFAULT '',
+    duration     INTEGER NOT NULL DEFAULT 0,
+    ratio        TEXT NOT NULL DEFAULT '',
+    resolution   TEXT NOT NULL DEFAULT '',
+    account_id   TEXT NOT NULL DEFAULT '',
+    session_id   TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'queued',
+    detail       TEXT NOT NULL DEFAULT '',
+    error        TEXT NOT NULL DEFAULT '',
+    node_id      TEXT NOT NULL DEFAULT '',
+    media_name   TEXT NOT NULL DEFAULT '',
+    file_size    INTEGER NOT NULL DEFAULT 0,
+    credit_before REAL NOT NULL DEFAULT -1,
+    credit_after  REAL NOT NULL DEFAULT -1,
+    started_at_ms INTEGER NOT NULL DEFAULT 0,
+    created_at   REAL NOT NULL DEFAULT 0,
+    updated_at   REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_video_jobs_created ON video_jobs(created_at);
+
 CREATE TABLE IF NOT EXISTS proxies (
     id           TEXT PRIMARY KEY,
     url          TEXT NOT NULL UNIQUE,
@@ -203,6 +227,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ],
         "models": [
             ("variant", "TEXT NOT NULL DEFAULT ''"),
+        ],
+        "video_jobs": [
+            ("started_at_ms", "INTEGER NOT NULL DEFAULT 0"),
         ],
     }
     for table, columns in additions.items():
@@ -822,6 +849,91 @@ class Database:
 
         return await self.run(apply)
 
+    # ------------------------------------------------------------- video jobs
+
+    async def add_video_job(self, job: VideoJob) -> None:
+        def apply(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO video_jobs (id, prompt, model, duration, ratio, resolution,"
+                " account_id, session_id, status, detail, error, node_id, media_name,"
+                " file_size, credit_before, credit_after, started_at_ms, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                video_job_params(job),
+            )
+            conn.commit()
+
+        await self.run(apply)
+
+    async def update_video_job(self, job_id: str, apply_fn: Callable[[VideoJob], None]) -> VideoJob | None:
+        """Read, mutate, write one job under the database lock.
+
+        The whole row is rewritten because the caller's function is arbitrary:
+        a partial update would have to know which columns it touched, and the
+        only interesting mutations are small enough that rewriting is cheaper
+        than reasoning about what changed.
+        """
+
+        def apply(conn: sqlite3.Connection) -> VideoJob | None:
+            row = conn.execute("SELECT * FROM video_jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                return None
+            job = video_job_from_row(row)
+            apply_fn(job)
+            job.updated_at = records.now_ts()
+            conn.execute(
+                "UPDATE video_jobs SET prompt = ?, model = ?, duration = ?, ratio = ?,"
+                " resolution = ?, account_id = ?, session_id = ?, status = ?, detail = ?,"
+                " error = ?, node_id = ?, media_name = ?, file_size = ?,"
+                " credit_before = ?, credit_after = ?, started_at_ms = ?, created_at = ?, updated_at = ?"
+                " WHERE id = ?",
+                video_job_params(job),
+            )
+            conn.commit()
+            return job
+
+        return await self.run(apply)
+
+    async def video_job(self, job_id: str) -> VideoJob | None:
+        def query(conn: sqlite3.Connection) -> VideoJob | None:
+            row = conn.execute("SELECT * FROM video_jobs WHERE id = ?", (job_id,)).fetchone()
+            return video_job_from_row(row) if row else None
+
+        return await self.run(query)
+
+    async def list_video_jobs(self, limit: int = 100) -> list[VideoJob]:
+        def query(conn: sqlite3.Connection) -> list[VideoJob]:
+            rows = conn.execute(
+                "SELECT * FROM video_jobs ORDER BY created_at DESC, id LIMIT ?", (limit,)
+            ).fetchall()
+            return [video_job_from_row(row) for row in rows]
+
+        return await self.run(query)
+
+    async def active_video_jobs(self) -> list[VideoJob]:
+        """Jobs the poller was not finished with — what a restart must resume."""
+
+        def query(conn: sqlite3.Connection) -> list[VideoJob]:
+            marks = ",".join("?" * len(records.VIDEO_ACTIVE))
+            rows = conn.execute(
+                f"SELECT * FROM video_jobs WHERE status IN ({marks})"
+                " ORDER BY created_at, id",
+                list(records.VIDEO_ACTIVE),
+            ).fetchall()
+            return [video_job_from_row(row) for row in rows]
+
+        return await self.run(query)
+
+    async def delete_video_job(self, job_id: str) -> VideoJob | None:
+        def apply(conn: sqlite3.Connection) -> VideoJob | None:
+            row = conn.execute("SELECT * FROM video_jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                return None
+            conn.execute("DELETE FROM video_jobs WHERE id = ?", (job_id,))
+            conn.commit()
+            return video_job_from_row(row)
+
+        return await self.run(apply)
+
     # ------------------------------------------------------------------ proxies
 
     async def list_proxies(self) -> list[Proxy]:
@@ -1100,4 +1212,53 @@ def _audit_from_row(row: sqlite3.Row) -> Audit:
         error=row["error"],
         request_body=row["request_body"],
         response_body=row["response_body"],
+    )
+
+
+def video_job_from_row(row: sqlite3.Row) -> VideoJob:
+    return VideoJob(
+        id=row["id"],
+        prompt=row["prompt"],
+        model=row["model"],
+        duration=row["duration"],
+        ratio=row["ratio"],
+        resolution=row["resolution"],
+        account_id=row["account_id"],
+        session_id=row["session_id"],
+        status=row["status"],
+        detail=row["detail"],
+        error=row["error"],
+        node_id=row["node_id"],
+        media_name=row["media_name"],
+        file_size=row["file_size"],
+        credit_before=row["credit_before"],
+        credit_after=row["credit_after"],
+        started_at_ms=row["started_at_ms"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def video_job_params(job: VideoJob) -> tuple[Any, ...]:
+    """Every column the two statements write, in the order they list them."""
+    return (
+        job.id,
+        job.prompt,
+        job.model,
+        job.duration,
+        job.ratio,
+        job.resolution,
+        job.account_id,
+        job.session_id,
+        job.status,
+        job.detail,
+        job.error,
+        job.node_id,
+        job.media_name,
+        job.file_size,
+        job.credit_before,
+        job.credit_after,
+        job.started_at_ms,
+        job.created_at,
+        job.updated_at,
     )

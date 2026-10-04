@@ -67,6 +67,15 @@ class UpstreamSettings:
     agent_list_path: str = "/minimax-cloud/api/v1/agent"
     config_path: str = "/minimax-cloud/api/v1/config"
     connections_path: str = "/minimax-cloud/api/v1/channel/connections"
+    # Video turns: the plugin's enable/install paths, and the two drive reads
+    # that announce and resolve the finished file.  Settings rather than
+    # constants because they belong to the upstream bundle, and a rename should
+    # be a console edit rather than a rebuild.
+    plugin_enable_path: str = "/minimax-cloud/api/v1/plugins/{plugin_name}/enable"
+    plugin_install_path: str = "/minimax-cloud/api/v1/plugins/{plugin_name}/install"
+    plugin_enabled_path: str = "/minimax-cloud/api/v1/plugins/enabled"
+    summaries_path: str = "/minimax-cloud/api/v1/session/{session_id}/input-summaries"
+    drive_file_path: str = "/minimax-cloud/api/v1/drive/file/{node_id}"
     # The agent's model field is an object upstream and an empty one is
     # rejected, so it is only sent when the operator supplies a template.
     model_payload: str = ""
@@ -241,6 +250,54 @@ class KeepaliveSettings:
 
 
 @dataclass
+class VideoSettings:
+    """The console's video path.
+
+    A video is not a chat turn: it bills account credits rather than tokens, it
+    takes minutes rather than seconds, and its result is a file in the account's
+    drive rather than a message.  Every knob here belongs to that difference.
+    """
+
+    # The plugin a video turn must name.  Both the mention and the options tag
+    # are upstream-vocabulary: a rename upstream should be a console edit here,
+    # not a rebuild.
+    plugin_name: str = "video-creater"
+    options_tag: str = "video-generation-options"
+    # Where finished videos are kept.  Separate from the media directory on
+    # purpose: generated images are cache under a byte ceiling and get pruned;
+    # a video the operator asked for is theirs, and is never pruned under them.
+    videos_dir: str = ""
+    # Defaults for anything the caller left out.  They matter more than an
+    # ordinary default would: the plugin asks the user to confirm every
+    # unspecified choice before it generates, and a headless turn has nobody to
+    # answer, so an omitted parameter stalls the turn rather than falling back.
+    default_duration: int = 6
+    default_ratio: str = "16:9"
+    default_resolution: str = "768P"
+    # Turn budget.  A chat turn that takes a minute is broken; a video turn that
+    # takes a minute has not started yet.  The stream ends when the agent has
+    # *submitted* the job, so this bounds the submit, not the render.
+    turn_timeout_sec: int = 900
+    idle_timeout_sec: int = 180
+    # The render outlives the turn.  These bound the drive polling that waits
+    # for the file after the stream has already closed.
+    poll_gap_sec: int = 45
+    poll_jitter_sec: int = 20
+    poll_timeout_sec: int = 2400
+    # How many jobs the poller runs at once.  One video turn holds an account's
+    # attention for tens of minutes, and more than a couple in flight against
+    # the same egress is how a stream gets reset mid-submit.
+    max_concurrent: int = 2
+    # Enable `@video-creater` on an account that lacks it before spending a
+    # turn on it.  Free and idempotent, and without it the turn is certain to
+    # waste credit on an agent that has no tool to call.
+    auto_enable_plugin: bool = True
+    # The signed download URL is good for about two hours; the download itself
+    # gets its own bound so a stalled CDN fetch cannot wedge a worker.
+    download_timeout_sec: int = 300
+
+
+@dataclass
 class Settings:
     upstream: UpstreamSettings = field(default_factory=UpstreamSettings)
     routing: RoutingSettings = field(default_factory=RoutingSettings)
@@ -249,11 +306,13 @@ class Settings:
     signin: SigninSettings = field(default_factory=SigninSettings)
     signup: SignupSettings = field(default_factory=SignupSettings)
     keepalive: KeepaliveSettings = field(default_factory=KeepaliveSettings)
+    video: VideoSettings = field(default_factory=VideoSettings)
 
 
 def default_settings(data_dir: str) -> Settings:
     return Settings(
         media=MediaSettings(generated_dir=f"{data_dir}/generated"),
+        video=VideoSettings(videos_dir=f"{data_dir}/videos"),
         signin=SigninSettings(),
     )
 
@@ -310,6 +369,15 @@ def normalize(settings: Settings, data_dir: str) -> bool:
         up.config_path = default.upstream.config_path
     if not up.connections_path:
         up.connections_path = default.upstream.connections_path
+    for name in (
+        "plugin_enable_path",
+        "plugin_install_path",
+        "plugin_enabled_path",
+        "summaries_path",
+        "drive_file_path",
+    ):
+        if not getattr(up, name):
+            setattr(up, name, getattr(default.upstream, name))
     up.screen_width = max(1, up.screen_width)
     up.screen_height = max(1, up.screen_height)
     if not up.language:
@@ -403,6 +471,28 @@ def normalize(settings: Settings, data_dir: str) -> bool:
     keepalive = settings.keepalive
     keepalive.interval_sec = _int_range(keepalive.interval_sec, 60, 86400, default.keepalive.interval_sec)
 
+    video = settings.video
+    if not video.videos_dir:
+        video.videos_dir = default.video.videos_dir
+    if not video.plugin_name:
+        video.plugin_name = default.video.plugin_name
+    if not video.options_tag:
+        video.options_tag = default.video.options_tag
+    if not video.default_ratio:
+        video.default_ratio = default.video.default_ratio
+    if not video.default_resolution:
+        video.default_resolution = default.video.default_resolution
+    video.default_duration = _int_range(video.default_duration, 1, 60, default.video.default_duration)
+    video.turn_timeout_sec = _int_range(video.turn_timeout_sec, 30, 3600, default.video.turn_timeout_sec)
+    video.idle_timeout_sec = _int_range(video.idle_timeout_sec, 10, 600, default.video.idle_timeout_sec)
+    video.poll_gap_sec = _int_range(video.poll_gap_sec, 5, 600, default.video.poll_gap_sec)
+    video.poll_jitter_sec = _int_range(video.poll_jitter_sec, 0, 120, default.video.poll_jitter_sec)
+    video.poll_timeout_sec = _int_range(video.poll_timeout_sec, 60, 7200, default.video.poll_timeout_sec)
+    video.max_concurrent = _int_range(video.max_concurrent, 1, 8, default.video.max_concurrent)
+    video.download_timeout_sec = _int_range(
+        video.download_timeout_sec, 10, 1800, default.video.download_timeout_sec
+    )
+
     return settings != before
 
 
@@ -432,6 +522,7 @@ SECTIONS = (
     "signin",
     "signup",
     "keepalive",
+    "video",
 )
 
 # Fields whose value must not travel to the console in the clear.

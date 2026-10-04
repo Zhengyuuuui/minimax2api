@@ -65,6 +65,26 @@ AUDIT_ERROR = "error"
 
 MEDIA_IMAGE = "image"
 
+# Video job status.  A job is the asynchronous shape of a video turn: the
+# upstream accepts it during the turn and renders it later, so the states past
+# `running` describe the drive lookup, not the conversation.
+VIDEO_QUEUED = "queued"
+VIDEO_RUNNING = "running"
+VIDEO_RENDERING = "rendering"
+VIDEO_DOWNLOADING = "downloading"
+VIDEO_DONE = "done"
+VIDEO_FAILED = "failed"
+VIDEO_STATUSES = (
+    VIDEO_QUEUED,
+    VIDEO_RUNNING,
+    VIDEO_RENDERING,
+    VIDEO_DOWNLOADING,
+    VIDEO_DONE,
+    VIDEO_FAILED,
+)
+# Anything in these is unfinished and worth resuming after a restart.
+VIDEO_ACTIVE = (VIDEO_QUEUED, VIDEO_RUNNING, VIDEO_RENDERING, VIDEO_DOWNLOADING)
+
 
 def now_ts() -> float:
     return time.time()
@@ -448,6 +468,85 @@ class MediaItem:
             "model": self.model,
             "accountName": self.account_name,
             "createdAt": iso(self.created_at),
+        }
+
+
+@dataclass
+class VideoJob:
+    """One requested video, and everything known about its progress.
+
+    The row is the job's only durable form: the conversation stream that
+    submitted it closes long before the render finishes, and the bridge restarts
+    while a render is in flight.  Everything a later poll needs to find the file
+    again — account, session, the timestamp the turn started at — is therefore
+    stored rather than kept in memory.
+
+    ``credit_before``/``credit_after`` are -1 rather than 0 for "unknown": a
+    video with a zero balance is a fact worth showing, and it must not be
+    confused with a read that never happened.
+    """
+
+    id: str = ""
+    prompt: str = ""
+    # The upstream model id the options block carries, e.g. ``MiniMax-H3-Max``.
+    model: str = ""
+    duration: int = 0
+    ratio: str = ""
+    resolution: str = ""
+    account_id: str = ""
+    # The session the turn opened.  Filled the moment create_session answers,
+    # before the message is even sent: a turn whose stream dies still has to be
+    # findable in the drive, and this id is the only way back to it.
+    session_id: str = ""
+    status: str = VIDEO_QUEUED
+    # The agent's own words from the turn.  When nothing is produced this is the
+    # only evidence of why, and it is the caller's answer verbatim.
+    detail: str = ""
+    error: str = ""
+    # The drive node the finished file was found at.
+    node_id: str = ""
+    # File name inside the videos directory.  Kept as a name, not a path, so
+    # moving the directory does not invalidate the record.
+    media_name: str = ""
+    file_size: int = 0
+    credit_before: float = -1.0
+    credit_after: float = -1.0
+    # The instant the message POST went out, in unix milliseconds.  The drive
+    # cutoff: an artefact created before this belongs to an earlier turn of the
+    # same session, not to this job.  Stored rather than derived from
+    # ``created_at`` because the enable call and the session open sit between
+    # the two, and a file the agent produced cannot predate the turn that
+    # asked for it.
+    started_at_ms: int = 0
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "prompt": self.prompt,
+            "model": self.model,
+            "duration": self.duration,
+            "ratio": self.ratio,
+            "resolution": self.resolution,
+            "accountId": self.account_id,
+            "sessionId": self.session_id,
+            "status": self.status,
+            "detail": self.detail,
+            "error": self.error,
+            "nodeId": self.node_id,
+            "mediaName": self.media_name,
+            "fileSize": self.file_size,
+            "creditBefore": self.credit_before,
+            "creditAfter": self.credit_after,
+            "startedAtMs": self.started_at_ms,
+            "creditSpent": (
+                round(self.credit_before - self.credit_after, 3)
+                if self.credit_before >= 0 and self.credit_after >= 0
+                else None
+            ),
+            "createdAt": iso(self.created_at),
+            "updatedAt": iso(self.updated_at),
         }
 
 

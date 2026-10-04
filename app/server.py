@@ -30,6 +30,7 @@ from . import pool as pool_mod
 from . import signin as signin_mod
 from . import signup as signup_mod
 from . import upstream
+from . import video as video_mod
 from .db import Database
 from .media import MediaStore
 
@@ -87,19 +88,31 @@ class AppState:
         # time a scheduled or manual claim runs, and a 401 there is expiry, not a
         # dead account — renew once, then claim.
         self.signin.renewer = self.keepalive.renew_account
+        # Video generation.  Console-only by design: it reaches the pool and the
+        # upstream client directly but is never wired into the gateway, so no
+        # `/v1` route can spend account credits.
+        self.video = video_mod.VideoService(
+            self.db, self.pool, self.client, lambda: self.db.settings()
+        )
 
     async def open(self) -> None:
         await self.db.connect()
         self.media.ensure_dir()
+        self.video.videos_dir().mkdir(parents=True, exist_ok=True)
         await self.pool.load()
         # Only one background task touches accounts, so there is nothing here to
         # coordinate beyond starting it.
         self.signin.start()
         self.keepalive.start()
+        # A render outlives the process: a job that was watching a drive when
+        # the bridge stopped is resumed by reading that drive again, never by
+        # sending the turn a second time.
+        await self.video.resume_pending()
 
     async def close(self) -> None:
         await self.signin.stop()
         await self.keepalive.stop()
+        await self.video.shutdown()
         await self.client.aclose()
 
 
@@ -122,6 +135,7 @@ def create_app(data_dir: str | None = None) -> FastAPI:
     app.state.bridge = state
 
     app.add_exception_handler(admin_mod.AdminError, _admin_error)
+    app.add_exception_handler(video_mod.VideoError, _video_error)
     app.add_exception_handler(gateway_mod.APIError, _api_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
 
@@ -395,6 +409,57 @@ def _register(app: FastAPI, state: AppState) -> None:
         ids = body.get("accountIds") if isinstance(body, dict) else None
         return await state.admin.credit_refresh(ids if isinstance(ids, list) else None)
 
+    # ------------------------------------------------------------------- videos
+    #
+    # Console-only.  These routes reach the same pool as `/v1`, but nothing
+    # under `/v1` reaches them: a video turn bills account credits and runs for
+    # minutes, and the public surface's accounting is not built for either.
+
+    @app.get("/admin/api/videos/models")
+    async def video_models() -> Any:
+        return video_mod.model_catalog()
+
+    @app.get("/admin/api/videos")
+    async def list_videos(request: Request) -> Any:
+        return await state.video.list_json()
+
+    @app.post("/admin/api/videos")
+    async def submit_video(request: Request) -> Any:
+        body = await json_body(request)
+        if not isinstance(body, dict):
+            raise video_mod.VideoError("body must be a JSON object")
+        raw_duration = body.get("duration")
+        return await state.video.submit_json(
+            prompt=str(body.get("prompt") or ""),
+            model_id=str(body.get("model") or ""),
+            account_id=str(body.get("accountId") or ""),
+            duration=int(raw_duration) if isinstance(raw_duration, (int, float)) else 0,
+            ratio=str(body.get("ratio") or ""),
+            resolution=str(body.get("resolution") or ""),
+        )
+
+    @app.get("/admin/api/videos/{job_id}")
+    async def video_detail(job_id: str) -> Any:
+        return await state.video.get_json(job_id)
+
+    @app.post("/admin/api/videos/{job_id}/cancel")
+    async def video_cancel(job_id: str) -> Any:
+        return {"cancelled": await state.video.cancel(job_id)}
+
+    @app.delete("/admin/api/videos/{job_id}")
+    async def video_delete(job_id: str) -> Any:
+        return {"deleted": await state.video.delete(job_id)}
+
+    @app.get("/admin/api/videos/{job_id}/file")
+    async def video_file(job_id: str) -> Any:
+        resolved = await state.video.file_for(job_id)
+        if resolved is None:
+            return JSONResponse(
+                {"error": "not found or not finished"}, status_code=404
+            )
+        path, job = resolved
+        return FileResponse(path, filename=f"{job_id}.mp4", media_type="video/mp4")
+
     # ------------------------------------------------------------------- pages
 
     for path in ("/", "/admin", "/admin/"):
@@ -441,6 +506,10 @@ def _media_type(path: Path) -> str:
 
 async def _admin_error(request: Request, exc: admin_mod.AdminError) -> JSONResponse:
     return JSONResponse({"error": exc.message}, status_code=exc.status)
+
+
+async def _video_error(request: Request, exc: video_mod.VideoError) -> JSONResponse:
+    return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 async def _api_error(request: Request, exc: gateway_mod.APIError) -> JSONResponse:

@@ -56,6 +56,22 @@ DEFAULT_SIGNIN_CLAIM_PATH = "/minimax-cloud/api/v1/signin/claim"
 DEFAULT_CREDIT_PATH = "/matrix/api/v1/commerce/get_membership_info"
 DEFAULT_CREDIT_DETAILS_PATH = "/minimax-cloud/api/v1/credit/details"
 
+# Video generation reaches the upstream the same way the web composer does: a
+# turn that mentions the plugin, then a drive read for the finished file.  These
+# are the two drive calls plus the plugin's enable path.  All three belong to the
+# upstream bundle, so a rename is a settings edit, not a rebuild — which is why
+# they are read through `resolve_path` like every other endpoint here.
+DEFAULT_PLUGIN_ENABLE_PATH = "/minimax-cloud/api/v1/plugins/{plugin_name}/enable"
+DEFAULT_PLUGIN_INSTALL_PATH = "/minimax-cloud/api/v1/plugins/{plugin_name}/install"
+DEFAULT_PLUGIN_ENABLED_PATH = "/minimax-cloud/api/v1/plugins/enabled"
+DEFAULT_SESSION_SUMMARIES_PATH = "/minimax-cloud/api/v1/session/{session_id}/input-summaries"
+DEFAULT_DRIVE_FILE_PATH = "/minimax-cloud/api/v1/drive/file/{node_id}"
+
+# The `client_intent` every video turn carries.  The web bundle's tool table maps
+# all four video tools to this one string; whether it changes anything upstream
+# has never been proven, but it is what the web client sends, so it is sent.
+VIDEO_CLIENT_INTENT = "video_generation"
+
 # The upstream's code for a rejected session, mapped onto InvalidCredential so
 # the caller retires the account instead of merely cooling it down.
 STATUS_SESSION_EXPIRED = 1022100011
@@ -1692,3 +1708,147 @@ class MiniMaxClient:
         return RawResponse(
             status=response.status_code, body=_snippet(raw), url=_redact_url(target.url)
         )
+
+    # ---------------------------------------------------------------- video glue
+
+    async def enable_video_plugin(self, cred: Credential, plugin: str) -> dict[str, Any]:
+        """Make the account's agent able to route `@<plugin>` mentions.
+
+        Most accounts in a freshly registered pool do not have the video plugin
+        installed, and a turn that mentions a plugin the account cannot route
+        still bills — the agent spends minutes looking for a tool that is not
+        there and answers with prose.  The enable call is idempotent and free:
+        an already-installed plugin answers the same shape it always did.
+
+        Install and enable are two endpoints and either may be the one that is
+        missing; both are tried, in that order, and a failure of the second is
+        reported rather than swallowed, because "enabled" is the property the
+        turn depends on.
+        """
+        settings = self._settings_fn()
+        install = resolve_path(
+            settings.upstream.plugin_install_path, DEFAULT_PLUGIN_INSTALL_PATH
+        ).replace("{plugin_name}", plugin)
+        enable = resolve_path(
+            settings.upstream.plugin_enable_path, DEFAULT_PLUGIN_ENABLE_PATH
+        ).replace("{plugin_name}", plugin)
+        out: dict[str, Any] = {}
+        for label, path in (("install", install), ("enable", enable)):
+            try:
+                payload = await self._read_json(
+                    cred,
+                    self.agent_target(cred, path, method="POST", body="{}"),
+                    f"plugin {label}",
+                )
+            except UpstreamError as err:
+                out[f"{label}_error"] = str(err)
+                continue
+            core = _core_of(payload)
+            out[label] = {
+                "installed": bool(core.get("install_exists") or core.get("package")),
+                "enabled": bool(core.get("enabled")),
+            }
+        return out
+
+    async def session_artifacts(self, cred: Credential, session_id: str) -> list[dict[str, Any]]:
+        """Every file the session's turns have produced.
+
+        The finished video is *only* announced here.  The conversation stream
+        carries the agent's prose and tool frames; the mp4 itself lands in the
+        account's drive, so a session can succeed and still show no media from
+        the stream alone.  This is the free GET that closes that gap.
+        """
+        settings = self._settings_fn()
+        path = resolve_path(
+            settings.upstream.summaries_path, DEFAULT_SESSION_SUMMARIES_PATH
+        ).replace("{session_id}", session_id)
+        payload = await self._read_json(
+            cred, self.agent_target(cred, path, method="GET"), "summaries"
+        )
+        out: list[dict[str, Any]] = []
+        for turn in payload.get("summaries") or []:
+            if isinstance(turn, dict):
+                for artifact in turn.get("artifacts") or []:
+                    if isinstance(artifact, dict):
+                        out.append(artifact)
+        return out
+
+    async def drive_download_url(self, cred: Credential, node_id: str) -> str:
+        """Resolve one drive node to a signed, absolute URL.
+
+        Two details of this answer are not negotiable.  The URL comes back
+        *without a scheme* (`host/path?signature`), and passing that on produces
+        a link no client can fetch that still looks plausible.  And it is a
+        bearer credential with a two-hour expiry: it must not be logged and must
+        not be cached, which is why only the absolute URL is returned and the
+        rest of the envelope is dropped.
+        """
+        if not (node_id or "").strip():
+            return ""
+        settings = self._settings_fn()
+        path = resolve_path(settings.upstream.drive_file_path, DEFAULT_DRIVE_FILE_PATH).replace(
+            "{node_id}", node_id
+        )
+        payload = await self._read_json(
+            cred, self.agent_target(cred, f"{path}/download-url", method="GET"), "download-url"
+        )
+        return absolute_download_url(str(payload.get("download_url") or ""))
+
+
+def absolute_download_url(raw: str) -> str:
+    """Give the drive's scheme-less link a scheme.  Empty in, empty out."""
+    trimmed = (raw or "").strip()
+    if not trimmed:
+        return ""
+    if trimmed.startswith(("http://", "https://")):
+        return trimmed
+    return "https://" + trimmed
+
+
+def video_turn_text(
+    prompt: str,
+    model: str,
+    *,
+    plugin: str,
+    tag: str,
+    duration: int,
+    ratio: str,
+    resolution: str,
+) -> str:
+    """Compose the message a video turn sends: the mention, then the options block.
+
+    Both halves are protocol, not styling.  `@video-creater` in plain text is
+    what routes the turn to the plugin — verified against the live upstream,
+    which echoes the four parameters back verbatim.  The block travels at the
+    *end* of the message because the web bundle's own reader is anchored to the
+    end and takes the first match, so anything after it would be silently kept
+    out of the parse.
+
+    Every parameter is always filled in.  The plugin's skill asks the user to
+    confirm any unspecified choice before it generates, and a headless turn has
+    nobody to answer — an omitted parameter does not fall back to a default, it
+    stalls the whole turn (and still bills).
+    """
+    mention = "@" + (plugin or "video-creater")
+    body = (prompt or "").strip()
+    lowered = body.lower()
+    needle = mention.lower()
+    has_mention = False
+    index = lowered.find(needle)
+    while index >= 0:
+        end = index + len(needle)
+        if end >= len(lowered) or (not lowered[end].isalnum() and lowered[end] != "_"):
+            has_mention = True
+            break
+        index = lowered.find(needle, end)
+    if not has_mention:
+        body = mention if not body else f"{mention} {body}"
+    options = {
+        "duration": int(duration),
+        "model": model,
+        "ratio": ratio,
+        "resolution": resolution,
+    }
+    block = json.dumps(options, ensure_ascii=False, separators=(",", ":"))
+    open_tag, close_tag = f"<{tag}>", f"</{tag}>"
+    return f"{body}\n\n{open_tag}\n{block}\n{close_tag}"
