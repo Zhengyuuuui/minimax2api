@@ -324,9 +324,23 @@ class Gateway:
             yield _error_frame(err, dialect)
             return
 
+        # Usage rides in the terminal `message_delta` frame of the upstream
+        # stream.  A non-streamed turn gets it from the response body, but a
+        # streamed one had no equivalent path — so every streamed audit read
+        # `0/0` while the client saw the real numbers.  Capturing it here makes
+        # the audit and the client report the same turn.
+        def note_usage(prompt_tokens: int, completion_tokens: int) -> None:
+            trace.prompt_tokens = int(prompt_tokens)
+            trace.completion_tokens = int(completion_tokens)
+
         frames = _aiter_sse(response)
         if dialect == "openai":
-            frames = proxy.anthropic_stream_to_openai(frames, model.id)
+            frames = proxy.anthropic_stream_to_openai(frames, model.id, on_usage=note_usage)
+        else:
+            # The Anthropic caller gets the upstream's own frames, so the usage
+            # is not translated for us — the terminal frame is inspected as it
+            # passes.  `_usage_from_frame` returns None for every other frame.
+            frames = _tap_usage(frames, note_usage)
         try:
             async for frame in frames:
                 yield frame
@@ -337,6 +351,8 @@ class Gateway:
         finally:
             await response.aclose()
 
+        if trace.completion_tokens or trace.prompt_tokens:
+            await self._db.record_model_usage(model.id, 1, trace.completion_tokens)
         trace.finish(status=200)
         await self._db.append_audit(trace.record())
 
@@ -443,6 +459,41 @@ def _aiter_sse(response: Any) -> AsyncIterator[bytes]:
                 yield frame + b"\n\n"
         if buffer.strip():
             yield buffer
+
+    return generate()
+
+
+def _tap_usage(
+    frames: AsyncIterator[bytes],
+    on_usage: Any,
+) -> AsyncIterator[bytes]:
+    """Forward frames unchanged while lifting usage out of the terminal one.
+
+    The Anthropic dialect relays the upstream frames verbatim, so there is no
+    translation step to hang the callback on.  This inspects each frame on its
+    way past and calls ``on_usage`` when the frame carries token counts; every
+    frame is still yielded exactly as it arrived, so a caller sees no
+    difference.
+    """
+
+    async def generate() -> AsyncIterator[bytes]:
+        async for frame in frames:
+            _, data = proxy._parse_sse(frame)
+            if data is not None:
+                kind = data.get("type")
+                # `message_delta` carries the turn's final totals.  On some
+                # builds `message_start` reports an input count too, but it can
+                # also arrive with `input_tokens: 0` — so only a frame that
+                # actually reports a number is allowed to update the trace, and
+                # the terminal `message_delta` therefore wins.
+                source = data if kind == "message_delta" else (data.get("message") or {})
+                usage = source.get("usage") or {}
+                if kind in ("message_delta", "message_start") and usage:
+                    prompt_tokens = int(usage.get("input_tokens") or 0)
+                    completion_tokens = int(usage.get("output_tokens") or 0)
+                    if prompt_tokens or completion_tokens:
+                        on_usage(prompt_tokens, completion_tokens)
+            yield frame
 
     return generate()
 

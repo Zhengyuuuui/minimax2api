@@ -220,7 +220,9 @@ def anthropic_to_openai(message: dict[str, Any], model: str) -> dict[str, Any]:
 
 
 def anthropic_stream_to_openai(
-    frames: AsyncIterator[bytes], model: str
+    frames: AsyncIterator[bytes],
+    model: str,
+    on_usage: Any = None,
 ) -> AsyncIterator[bytes]:
     """Translate an Anthropic SSE stream into an OpenAI SSE stream.
 
@@ -228,6 +230,12 @@ def anthropic_stream_to_openai(
     blocks become choice deltas, ``tool_use`` blocks are accumulated and flushed
     as one ``tool_calls`` delta when the block closes, and the terminal usage
     frame feeds the closing chunk.  Everything else is dropped.
+
+    ``on_usage`` is called once, with ``(prompt_tokens, completion_tokens)``, the
+    moment the upstream reports them.  The OpenAI ``usage`` object and the
+    audit log want the same numbers, and only this loop sees the Anthropic
+    frame that carries them — so the caller gets a callback rather than having
+    to re-parse the stream it is forwarding.
     """
 
     async def generate() -> AsyncIterator[bytes]:
@@ -239,6 +247,13 @@ def anthropic_stream_to_openai(
         tool_order: list[int] = []
         prompt_tokens = 0
         completion_tokens = 0
+        reported = False
+
+        def report() -> None:
+            nonlocal reported
+            if on_usage is not None and not reported:
+                reported = True
+                on_usage(prompt_tokens, completion_tokens)
 
         def frame(delta: dict[str, Any], finish: str | None = None, usage: bool = False) -> bytes:
             payload: dict[str, Any] = {
@@ -304,11 +319,15 @@ def anthropic_stream_to_openai(
                     )
             elif kind == "message_delta":
                 usage = data.get("usage") or {}
+                # MiniMax 把 input_tokens 放 message_delta（message_start 里是 0）——不补这里流式 usage 永远 prompt=0
+                prompt_tokens = int(usage.get("input_tokens") or prompt_tokens)
                 completion_tokens = int(usage.get("output_tokens") or completion_tokens)
                 stop = (data.get("delta") or {}).get("stop_reason")
                 finish = {"tool_use": "tool_calls", "max_tokens": "length"}.get(stop or "", "stop")
+                report()
                 yield frame({}, finish, usage=True)
             elif kind == "message_stop":
+                report()
                 yield b"data: [DONE]\n\n"
 
     return generate()

@@ -228,6 +228,69 @@ def test_streaming_echo_filter_passes_a_non_echo_through():
     assert "".join(short.feed(c) for c in ["hi", "! there"]) + short.flush() == "hi! there"
 
 
+def test_openai_stream_reports_usage_to_callback():
+    """The streamed turn's token counts must reach the caller's audit.
+
+    The usage rides in the terminal `message_delta` frame, which the OpenAI
+    translation consumes to build the closing chunk.  Without the callback the
+    audit would read `0/0` while the client saw real numbers — which is exactly
+    the discrepancy this pins shut.
+    """
+    from app import model_api
+
+    frames = [
+        b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n',
+        b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+        b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1127,"output_tokens":596}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+
+    async def source():
+        for frame in frames:
+            yield frame
+
+    seen: list[tuple[int, int]] = []
+    out = []
+
+    async def drive():
+        async for chunk in model_api.anthropic_stream_to_openai(
+            source(), "MiniMax-M3.1-Flash-Thinking", on_usage=lambda p, c: seen.append((p, c))
+        ):
+            out.append(chunk)
+
+    asyncio.run(drive())
+    assert seen == [(1127, 596)]
+    # The client-facing closing chunk still carries the same numbers.
+    tail = b"".join(out)
+    assert b'"prompt_tokens": 1127' in tail and b'"completion_tokens": 596' in tail
+
+
+def test_anthropic_usage_tap_reads_the_terminal_frame():
+    """The Anthropic dialect forwards frames verbatim; the tap reads them."""
+    from app import gateway
+
+    frames = [
+        b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n',
+        b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":603,"output_tokens":892}}\n\n',
+    ]
+
+    async def source():
+        for frame in frames:
+            yield frame
+
+    seen: list[tuple[int, int]] = []
+    passthrough = []
+
+    async def drive():
+        async for frame in gateway._tap_usage(source(), lambda p, c: seen.append((p, c))):
+            passthrough.append(frame)
+
+    asyncio.run(drive())
+    assert seen == [(603, 892)]
+    # Nothing is altered on the way out.
+    assert passthrough == frames
+
+
 def test_openai_request_converts_to_anthropic():
     """The pure model API is Anthropic-shaped; an OpenAI caller is translated."""
     from app import model_api
