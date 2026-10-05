@@ -280,8 +280,10 @@ class Gateway:
             raise APIError(502, "upstream_error", "upstream returned invalid JSON") from err
 
         usage = message.get("usage") or {}
-        trace.prompt_tokens = int(usage.get("input_tokens") or 0)
-        trace.completion_tokens = int(usage.get("output_tokens") or 0)
+        # `input_tokens` alone omits the prompt cache: with caching on, most of a
+        # long context is counted in the cache fields, not here.  `token_usage`
+        # sums all three so the audit reflects the real prompt size.
+        trace.prompt_tokens, trace.completion_tokens, _ = proxy.token_usage(usage)
         trace.response_body = json.dumps(message, ensure_ascii=False)[: self._settings_fn().audit.body_limit_bytes]
         await self._db.record_model_usage(model.id, 1, trace.completion_tokens)
         trace.finish(status=200)
@@ -329,6 +331,10 @@ class Gateway:
         # streamed one had no equivalent path — so every streamed audit read
         # `0/0` while the client saw the real numbers.  Capturing it here makes
         # the audit and the client report the same turn.
+        #
+        # The callback carries *folded* counts: the upstream splits a prompt
+        # across `input_tokens` and the two cache fields, and with prompt
+        # caching on the cache read is the larger part.  See `token_usage`.
         def note_usage(prompt_tokens: int, completion_tokens: int) -> None:
             trace.prompt_tokens = int(prompt_tokens)
             trace.completion_tokens = int(completion_tokens)
@@ -339,7 +345,7 @@ class Gateway:
         else:
             # The Anthropic caller gets the upstream's own frames, so the usage
             # is not translated for us — the terminal frame is inspected as it
-            # passes.  `_usage_from_frame` returns None for every other frame.
+            # passes.  `_tap_usage` folds in the cache fields the same way.
             frames = _tap_usage(frames, note_usage)
         try:
             async for frame in frames:
@@ -489,8 +495,9 @@ def _tap_usage(
                 source = data if kind == "message_delta" else (data.get("message") or {})
                 usage = source.get("usage") or {}
                 if kind in ("message_delta", "message_start") and usage:
-                    prompt_tokens = int(usage.get("input_tokens") or 0)
-                    completion_tokens = int(usage.get("output_tokens") or 0)
+                    # Fold the cache fields in: `input_tokens` on its own is only
+                    # the uncached remainder, so a cached turn would look tiny.
+                    prompt_tokens, completion_tokens, _ = proxy.token_usage(usage)
                     if prompt_tokens or completion_tokens:
                         on_usage(prompt_tokens, completion_tokens)
             yield frame

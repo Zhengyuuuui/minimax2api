@@ -228,6 +228,77 @@ def test_streaming_echo_filter_passes_a_non_echo_through():
     assert "".join(short.feed(c) for c in ["hi", "! there"]) + short.flush() == "hi! there"
 
 
+@pytest.mark.parametrize(
+    "usage, expected",
+    [
+        # No cache: prompt is just the fresh input.
+        ({"input_tokens": 26, "output_tokens": 1}, (26, 1, 0)),
+        # Cache read: the bulk of the context is here, not in input_tokens.
+        (
+            {"input_tokens": 26, "output_tokens": 1, "cache_read_input_tokens": 142},
+            (168, 1, 142),
+        ),
+        # Cache write on a fresh prefix counts toward the prompt too.
+        (
+            {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 200},
+            (210, 5, 200),
+        ),
+        # Both directions at once.
+        (
+            {
+                "input_tokens": 5,
+                "output_tokens": 9,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 50,
+            },
+            (155, 9, 150),
+        ),
+    ],
+)
+def test_token_usage_folds_prompt_cache_into_prompt(usage, expected):
+    """`input_tokens` alone under-reports a cached prompt; all three fields sum.
+
+    opencode and the desktop client both enable prompt caching, so a long
+    context arrives almost entirely as `cache_read_input_tokens`.  Reporting
+    only `input_tokens` is what made every streamed turn look like a few dozen
+    tokens; the real prompt is the sum.
+    """
+    from app import model_api
+
+    assert model_api.token_usage(usage) == expected
+
+
+def test_anthropic_stream_to_openai_folds_cache_into_usage():
+    """The client-facing usage carries the cached prompt, split out the OpenAI way."""
+    from app import model_api
+
+    frames = [
+        b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":26,"output_tokens":0,"cache_read_input_tokens":142}}}\n\n',
+        b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":26,"output_tokens":1,"cache_read_input_tokens":142}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+
+    async def source():
+        for frame in frames:
+            yield frame
+
+    seen: list[tuple[int, int]] = []
+    out = []
+
+    async def drive():
+        async for chunk in model_api.anthropic_stream_to_openai(
+            source(), "MiniMax-M3.1-Flash-Thinking", on_usage=lambda p, c: seen.append((p, c))
+        ):
+            out.append(chunk)
+
+    asyncio.run(drive())
+    # 26 fresh + 142 cached = 168 prompt tokens, not 26.
+    assert seen == [(168, 1)]
+    tail = b"".join(out)
+    assert b'"prompt_tokens": 168' in tail
+    assert b'"cached_tokens": 142' in tail
+
+
 def test_openai_stream_reports_usage_to_callback():
     """The streamed turn's token counts must reach the caller's audit.
 

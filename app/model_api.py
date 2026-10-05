@@ -17,6 +17,29 @@ import time
 from typing import Any, AsyncIterator
 
 
+def token_usage(usage: dict[str, Any]) -> tuple[int, int, int]:
+    """Read real prompt/completion token counts out of an upstream usage block.
+
+    The upstream reports prompt tokens in *three* fields, and ``input_tokens``
+    alone is only the part that missed the prompt cache — with caching on (which
+    the desktop client and opencode both enable) the bulk of a long context
+    rides in ``cache_read_input_tokens``, so reporting ``input_tokens`` by
+    itself makes every turn look tiny.
+
+        real prompt = input_tokens + cache_read_input_tokens + cache_creation_input_tokens
+
+    Returns ``(prompt_tokens, completion_tokens, cached_tokens)``; the cached
+    count is broken out so a caller can surface it the OpenAI way
+    (``prompt_tokens_details.cached_tokens``) instead of hiding it inside the
+    total.
+    """
+    fresh = int(usage.get("input_tokens") or 0)
+    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+    cache_write = int(usage.get("cache_creation_input_tokens") or 0)
+    completion = int(usage.get("output_tokens") or 0)
+    return fresh + cache_read + cache_write, completion, cache_read + cache_write
+
+
 def openai_to_anthropic(body: dict[str, Any], model: str) -> dict[str, Any]:
     """Convert an OpenAI chat request into an Anthropic Messages request.
 
@@ -205,6 +228,8 @@ def anthropic_to_openai(message: dict[str, Any], model: str) -> dict[str, Any]:
     if tool_calls:
         msg["tool_calls"] = tool_calls
     usage = message.get("usage") or {}
+    prompt_tokens, completion_tokens, cached_tokens = token_usage(usage)
+    prompt_details: dict[str, Any] = {"cached_tokens": cached_tokens}
     return {
         "id": "chatcmpl-" + (message.get("id") or ""),
         "object": "chat.completion",
@@ -212,9 +237,10 @@ def anthropic_to_openai(message: dict[str, Any], model: str) -> dict[str, Any]:
         "model": model,
         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
         "usage": {
-            "prompt_tokens": usage.get("input_tokens", 0),
-            "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": prompt_details,
         },
     }
 
@@ -247,6 +273,7 @@ def anthropic_stream_to_openai(
         tool_order: list[int] = []
         prompt_tokens = 0
         completion_tokens = 0
+        cached_tokens = 0
         reported = False
 
         def report() -> None:
@@ -268,6 +295,7 @@ def anthropic_stream_to_openai(
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
+                    "prompt_tokens_details": {"cached_tokens": cached_tokens},
                 }
             return _sse(None, payload)
 
@@ -278,7 +306,11 @@ def anthropic_stream_to_openai(
             kind = data.get("type")
             if kind == "message_start":
                 usage = (data.get("message") or {}).get("usage") or {}
-                prompt_tokens = int(usage.get("input_tokens") or prompt_tokens)
+                seen_prompt, seen_completion, seen_cached = token_usage(usage)
+                if seen_prompt:
+                    prompt_tokens = seen_prompt
+                    cached_tokens = seen_cached
+                completion_tokens = seen_completion or completion_tokens
                 if not role_sent:
                     role_sent = True
                     yield frame({"role": "assistant"})
@@ -319,9 +351,14 @@ def anthropic_stream_to_openai(
                     )
             elif kind == "message_delta":
                 usage = data.get("usage") or {}
-                # MiniMax 把 input_tokens 放 message_delta（message_start 里是 0）——不补这里流式 usage 永远 prompt=0
-                prompt_tokens = int(usage.get("input_tokens") or prompt_tokens)
-                completion_tokens = int(usage.get("output_tokens") or completion_tokens)
+                # The terminal frame carries the turn's totals.  `token_usage`
+                # folds the two cache fields into the prompt count, so a cached
+                # long context is not reported as a few dozen tokens.
+                seen_prompt, seen_completion, seen_cached = token_usage(usage)
+                if seen_prompt:
+                    prompt_tokens = seen_prompt
+                    cached_tokens = seen_cached
+                completion_tokens = max(completion_tokens, seen_completion)
                 stop = (data.get("delta") or {}).get("stop_reason")
                 finish = {"tool_use": "tool_calls", "max_tokens": "length"}.get(stop or "", "stop")
                 report()
