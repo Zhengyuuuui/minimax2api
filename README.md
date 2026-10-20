@@ -4,6 +4,14 @@
 
 ## 📝 更新日志
 
+### 本次更新（模型目录同步上游：M3.1 Flash 转正，M2.7 系列下线）
+
+- **上游 `/mavis/api/v1/models` 已更新**：官方 `whitelist` / `model_order` 现为 `MiniMax-M3.1-Flash`、`MiniMax-M3`。原来的 **`MiniMax-M3.1-Flash-Preview` 改名（去掉 `-Preview`）**，**M2.7 系列从清单中移除**。
+- **内置目录自动跟随**：启动时同步上游清单——内置条目的 `upstream_model` 被改名的会更新（此前只在为空时才补，改名会被永久冻结）、已下线的内置模型自动从库中删除；自定义模型与用量统计不受影响。
+- **模型目录**：`minimax-agent` / `minimax-m3.1-flash` 的 `upstream_model` 改为 `MiniMax-M3.1-Flash`；`minimax-m2.7`、`minimax-m2.7-highspeed` 移除。当前共 5 个对话模型 + 1 个图像模型。
+- **探测默认模型**改为 `MiniMax-M3.1-Flash`（账号探测用的最小请求）。
+- **补充确认**：直连模型 API 的 `model` 字段只接受**字符串**；对象形式的 selector（`{"model_id":...}`）会返回 `400 invalid params`——该形态只在 Agent 会话链路使用。
+
 ### 本次更新（控制台视频生成 · 异步任务）
 
 - **新增控制台视频板块**：号池控制台新增「视频」页签，可选择模型 / 账号、填写提示词、设置时长/画幅/分辨率，提交后在任务列表里跟踪进度，成品可直接播放或下载。
@@ -41,7 +49,7 @@
 - **鉴权**：仅需 `Authorization: Bearer <token>`（与既有账号池 OAuth 完全一致），无需 `x-signature` / `yy` 签名。
 - **移除**：黑盒 Agent 的 `build_prompt` 拍平、`StreamingEchoFilter` 回显剥离、`_is_repeat_tail` 重复抑制、伪流式队列桥接等一整条链路（不再需要）。
 - **账号探测**改为一次最小的 `Messages` 调用，直接验证模型的 Bearer token。
-- 模型目录沿用上游真实 id：`MiniMax-M3.1-Flash-Preview` / `MiniMax-M3` / `MiniMax-M2.7(-highspeed)` 等。
+- 模型目录随上游同步：内置条目的 `upstream_model` 跟随官方清单（现为 `MiniMax-M3.1-Flash` / `MiniMax-M3`），上游改名的旧条目会自动更新，已下线的内置模型会自动移除。
 
 ### 本次更新（真流式转发 · 修复“一直 wait response”）
 
@@ -269,19 +277,19 @@ curl http://127.0.0.1:4555/v1/chat/completions \
 
 | 模型 ID | 显示名 | 上游 model | 说明 |
 |---|---|---|---|
-| `minimax-agent` | MiniMax Agent | `MiniMax-M3.1-Flash-Preview` | 默认对话模型 |
-| `minimax-m3.1-flash` | MiniMax M3.1 Flash Preview | `MiniMax-M3.1-Flash-Preview` | 新一代 Flash 预览版，512K / 可选 1M 上下文 |
-| `minimax-m3.1-flash-thinking` | MiniMax M3.1 Flash Preview Thinking | `MiniMax-M3.1-Flash-Preview` | 深度思考（thinking 由模型自身产生） |
-| `minimax-m3` | MiniMax M3 | `MiniMax-M3` | 对话模式 |
+| `minimax-agent` | MiniMax Agent | `MiniMax-M3.1-Flash` | 默认对话模型 |
+| `minimax-m3.1-flash` | MiniMax M3.1 Flash | `MiniMax-M3.1-Flash` | 新一代 Flash，512K / 可选 1M 上下文，输入支持文本/图片/视频 |
+| `minimax-m3.1-flash-thinking` | MiniMax M3.1 Flash Thinking | `MiniMax-M3.1-Flash` | 深度思考（上游 `thinking_config` 为 forced_on） |
+| `minimax-m3` | MiniMax M3 | `MiniMax-M3` | 对话模式，推理可切换（variants `thinking` / `none-thinking`） |
 | `minimax-m3-thinking` | MiniMax M3 Thinking | `MiniMax-M3` | 深度思考变体 |
-| `minimax-m2.7` | MiniMax M2.7 | `MiniMax-M2.7` | 上一代对话模型 |
-| `minimax-m2.7-highspeed` | MiniMax M2.7 HighSpeed | `MiniMax-M2.7-highspeed` | 上一代高速版 |
+| `minimax-image` | MiniMax Image | — | 图像生成 |
 
 > 以上为**对话 / 图像**模型（`/v1` 用）。**视频**模型不在公共模型列表里，只在控制台的视频板块可选（`GET /admin/api/videos/models`）：`MiniMax-H3-Max`、`MiniMax-H3.0`、`MiniMax-Hailuo-2.3`。视频走账号积分、耗时以分钟计，刻意与 `/v1` 隔离，详见「控制台 → 视频生成」。
 
-> 模型条目里的 `upstream_model` 就是直接发给直连模型 API 的 `model` 字段。上游的模型清单可实时读取：
-> `GET /mavis/api/v1/models`（含 `MiniMax-M3.1-Flash-Preview`、`MiniMax-M3`、`MiniMax-M2.7`、
-> `MiniMax-M2.7-highspeed`、`MiniMax-M2.5`）。thinking 由模型自身决定，不再需要单独的 variant 参数。
+> 模型条目里的 `upstream_model` 就是直接发给直连模型 API 的 `model` 字段（上游只接受**字符串**，对象形式的 selector 会 400）。
+> 上游的模型清单可实时读取：`GET /mavis/api/v1/models`。当前官方 `whitelist` 与 `model_order` 为
+> `MiniMax-M3.1-Flash`、`MiniMax-M3`（`MiniMax-M3.1-Flash-Preview` 与 M2.7 系列已从清单下线，虽然旧名仍被兼容接受）。
+> 内置目录随启动同步：上游改名会自动更新 `upstream_model`，下线的模型会自动移除；自定义模型不受影响。
 
 ## API 接口
 

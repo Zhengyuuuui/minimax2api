@@ -1405,7 +1405,7 @@ class MiniMaxClient:
         """
         started = time.monotonic()
         body = {
-            "model": "MiniMax-M3.1-Flash-Preview",
+            "model": "MiniMax-M3.1-Flash",
             "max_tokens": 1,
             "messages": [{"role": "user", "content": "ping"}],
         }

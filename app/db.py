@@ -33,6 +33,7 @@ from .records import (
     Quota,
     SigninPanel,
     VideoJob,
+    builtin_models,
     dumps,
     iso,
     loads_or_none,
@@ -405,11 +406,22 @@ class Database:
 
         models = [ModelConfig.from_row(row) for row in conn.execute("SELECT * FROM models")]
         if merge_builtin_models(models):
+            # A built-in retired upstream is removed, not just left behind: the
+            # console's model list is read from this table, so a stale row would
+            # keep offering a model the upstream no longer has.
+            fresh_ids = {model.id for model in builtin_models()}
+            stale = [
+                row["id"]
+                for row in conn.execute("SELECT * FROM models WHERE builtin = 1")
+                if row["id"] not in fresh_ids
+            ]
+            for stale_id in stale:
+                conn.execute("DELETE FROM models WHERE id = ?", (stale_id,))
             conn.executemany(
                 "INSERT INTO models (id, name, upstream, upstream_model, variant, type, enabled, builtin,"
                 " description, requests, tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(id) DO UPDATE SET upstream_model = excluded.upstream_model,"
-                " variant = excluded.variant",
+                " variant = excluded.variant, name = excluded.name, description = excluded.description",
                 [
                     (
                         model.id,

@@ -2198,3 +2198,57 @@ def test_video_run_skips_a_terminal_job(tmp_path):
         asyncio.run(service._run(job.id))
         assert not touched["turn"] and not touched["watch"], (status, touched)
 
+
+def test_merge_builtin_models_adopts_a_renamed_upstream_model():
+    """A built-in the upstream renamed is updated, not frozen at the old name."""
+    from app.records import ModelConfig, builtin_models, merge_builtin_models
+
+    frozen = ModelConfig(
+        id="minimax-m3.1-flash",
+        name="MiniMax M3.1 Flash",
+        upstream="chat",
+        upstream_model="MiniMax-M3.1-Flash-Preview",  # what the old freeze holds
+        type="chat",
+        enabled=True,
+        builtin=True,
+        requests=7,
+        tokens=99,
+    )
+    models = [frozen]
+    assert merge_builtin_models(models) is True
+    fresh = builtin_models()
+    expected = next(m.upstream_model for m in fresh if m.id == "minimax-m3.1-flash")
+    assert frozen.upstream_model == expected
+    assert expected == "MiniMax-M3.1-Flash"
+    # The stored operator state survives the merge.
+    assert frozen.requests == 7
+    assert frozen.tokens == 99
+
+
+def test_merge_builtin_models_retires_a_builtin_no_longer_offered():
+    """A built-in the upstream dropped is removed; custom models are kept."""
+    from app.records import MODEL_CHAT, ModelConfig, merge_builtin_models
+
+    retired = ModelConfig(
+        id="minimax-m2.7",
+        name="MiniMax M2.7",
+        upstream="chat",
+        upstream_model="MiniMax-M2.7",
+        type=MODEL_CHAT,
+        enabled=True,
+        builtin=True,
+    )
+    custom = ModelConfig(
+        id="my-model",
+        name="Mine",
+        upstream="chat",
+        upstream_model="whatever",
+        type=MODEL_CHAT,
+        enabled=True,
+        builtin=False,
+    )
+    models = [retired, custom]
+    merge_builtin_models(models)
+    ids = {m.id for m in models}
+    assert "minimax-m2.7" not in ids
+    assert "my-model" in ids

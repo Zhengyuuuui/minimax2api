@@ -700,11 +700,11 @@ def builtin_models() -> list[ModelConfig]:
             id="minimax-agent",
             name="MiniMax Agent",
             upstream="chat",
-            upstream_model="MiniMax-M3.1-Flash-Preview",
+            upstream_model="MiniMax-M3.1-Flash",
             type=MODEL_CHAT,
             enabled=True,
             builtin=True,
-            description="默认对话模型（M3.1 Flash 预览版）",
+            description="默认对话模型（M3.1 Flash，官方 model_order 首位）",
         ),
         ModelConfig(
             id="minimax-m3",
@@ -714,7 +714,7 @@ def builtin_models() -> list[ModelConfig]:
             type=MODEL_CHAT,
             enabled=True,
             builtin=True,
-            description="对话模式，响应更快",
+            description="对话模式，推理可切换（variants: thinking / none-thinking）",
         ),
         ModelConfig(
             id="minimax-m3-thinking",
@@ -729,44 +729,24 @@ def builtin_models() -> list[ModelConfig]:
         ),
         ModelConfig(
             id="minimax-m3.1-flash",
-            name="MiniMax M3.1 Flash Preview",
+            name="MiniMax M3.1 Flash",
             upstream="chat",
-            upstream_model="MiniMax-M3.1-Flash-Preview",
+            upstream_model="MiniMax-M3.1-Flash",
             type=MODEL_CHAT,
             enabled=True,
             builtin=True,
-            description="新一代 Flash 预览版，512K/1M 上下文，响应更快",
+            description="新一代 Flash，512K/1M 上下文，多模态输入（文本/图片/视频）",
         ),
         ModelConfig(
             id="minimax-m3.1-flash-thinking",
-            name="MiniMax M3.1 Flash Preview Thinking",
+            name="MiniMax M3.1 Flash Thinking",
             upstream="think",
-            upstream_model="MiniMax-M3.1-Flash-Preview",
+            upstream_model="MiniMax-M3.1-Flash",
             variant="thinking",
             type=MODEL_CHAT,
             enabled=True,
             builtin=True,
-            description="M3.1 Flash 预览版的深度思考模式",
-        ),
-        ModelConfig(
-            id="minimax-m2.7",
-            name="MiniMax M2.7",
-            upstream="chat",
-            upstream_model="MiniMax-M2.7",
-            type=MODEL_CHAT,
-            enabled=True,
-            builtin=True,
-            description="上一代对话模型",
-        ),
-        ModelConfig(
-            id="minimax-m2.7-highspeed",
-            name="MiniMax M2.7 HighSpeed",
-            upstream="chat",
-            upstream_model="MiniMax-M2.7-highspeed",
-            type=MODEL_CHAT,
-            enabled=True,
-            builtin=True,
-            description="上一代对话模型的高速版",
+            description="M3.1 Flash 的深度思考模式（上游 thinking_config 为 forced_on）",
         ),
         ModelConfig(
             id="minimax-image",
@@ -783,14 +763,15 @@ def builtin_models() -> list[ModelConfig]:
 def merge_builtin_models(models: list[ModelConfig]) -> bool:
     """Add any built-in entry the stored catalogue is missing; report changes.
 
-    Without this a new built-in never reaches an existing install: the catalogue
-    is only seeded when it is empty, so every old install keeps the list it froze
-    on day one.  Entries already present keep their stored state — the
-    operator's enable/disable choices and usage counters live there — with one
-    exception: an ``upstream_model`` a built-in entry is missing is adopted,
-    because there is no console or API that sets it and an empty value can
-    therefore never be intent.
-    """
+     Without this a new built-in never reaches an existing install: the catalogue
+     is only seeded when it is empty, so every old install keeps the list it froze
+     on day one.  Entries already present keep their stored state — the
+     operator's enable/disable choices and usage counters live there — with one
+     exception: an ``upstream_model`` the built-in disagrees with is adopted,
+     because there is no console or API that sets it.  The upstream renames its
+     models (``MiniMax-M3.1-Flash-Preview`` → ``MiniMax-M3.1-Flash``), so a
+     stored name the catalogue has since changed is a stale freeze, not intent.
+     """
     by_id = {model.id: model for model in builtin_models()}
     known = {model.id for model in models if model.id}
     changed = False
@@ -800,12 +781,12 @@ def merge_builtin_models(models: list[ModelConfig]) -> bool:
         builtin = by_id.get(model.id)
         if not builtin:
             continue
-        if builtin.upstream_model and not model.upstream_model:
+        if builtin.upstream_model and model.upstream_model != builtin.upstream_model:
             model.upstream_model = builtin.upstream_model
             changed = True
-        # The variant follows the same rule: no console sets it, so an empty one
-        # is "not yet known", not an operator's choice of the plain model.
-        if builtin.variant and not model.variant:
+        # The variant follows the same rule: no console sets it, so a differing
+        # one is "not yet known", not an operator's choice of the plain model.
+        if builtin.variant and model.variant != builtin.variant:
             model.variant = builtin.variant
             changed = True
     for model in builtin_models():
@@ -813,6 +794,13 @@ def merge_builtin_models(models: list[ModelConfig]) -> bool:
             continue
         models.append(model)
         known.add(model.id)
+        changed = True
+    # A built-in the upstream retired (M2.7 once its replacements shipped) is
+    # dropped, so the console does not offer a model the upstream no longer
+    # lists.  Only built-ins go: an operator's own entries are never touched.
+    kept = [m for m in models if not (m.builtin and m.id and m.id not in by_id)]
+    if len(kept) != len(models):
+        models[:] = kept
         changed = True
     return changed
 
