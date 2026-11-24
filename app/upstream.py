@@ -829,6 +829,21 @@ class MiniMaxClient:
         for client in clients.values():
             await client.aclose()
 
+    async def _drop_client(self, key: str) -> None:
+        """Retire a cached client whose connection pool has gone bad.
+
+        A socket the upstream closed without telling us looks reusable until a
+        request stalls on it.  When that happens the whole pool can be poisoned
+        — every later request borrows the same dead socket — so the client is
+        discarded instead of trusted again; the next call builds a fresh one.
+        """
+        client = self._clients.pop(key, None)
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 - closing a broken client is best-effort
+                pass
+
     # ---------------------------------------------------------------- addressing
 
     def base_url(self, settings: Settings, cred: Credential) -> str:
@@ -1107,7 +1122,21 @@ class MiniMaxClient:
             timeout=timeout,
         )
         try:
-            response = await client.send(request, stream=stream)
+            # Bound the *header* wait separately from the body.  `timeout` above
+            # governs the whole request and is minutes long because a stream can
+            # legitimately run that long — but the response headers should arrive
+            # in seconds.  If they do not, the connection is dead (a reused
+            # keep-alive socket the upstream already closed is the usual cause)
+            # and waiting the full read timeout is what the client sees as "wait
+            # for response, first token never comes".  Failing fast here lets the
+            # caller retry on a fresh connection instead.
+            ttfb = min(45.0, float(timeout)) if timeout else 45.0
+            response = await asyncio.wait_for(client.send(request, stream=stream), timeout=ttfb)
+        except asyncio.TimeoutError as err:
+            # The pool is poisoned: drop the client so the retry connects anew
+            # instead of borrowing the same dead socket again.
+            await self._drop_client(self._client_key(settings, urlsplit(url).hostname or ""))
+            raise UpstreamError(f"upstream sent no response headers within {ttfb:.0f}s") from err
         except httpx.HTTPError as err:
             raise _safe_transport_error(err, cred) from err
         if response.status_code in (401, 403):
@@ -1144,17 +1173,28 @@ class MiniMaxClient:
         return self._client_for(self._settings_fn(), host)
 
     def _client_for(self, settings: Settings, host: str) -> httpx.AsyncClient:
-        proxy = (settings.upstream.proxy or "").strip()
-        # Loopback never goes through the proxy: see is_loopback.  The two
-        # clients are cached separately so connection pooling is preserved in
-        # both cases.
-        if proxy and not is_loopback(host):
-            key = f"proxy:{proxy}"
-        else:
-            key = "direct"
+        key = self._client_key(settings, host)
         client = self._clients.get(key)
         if client is None or client.is_closed:
-            kwargs: dict[str, Any] = {"timeout": self._timeout(settings), "trust_env": False}
+            proxy = (settings.upstream.proxy or "").strip()
+            kwargs: dict[str, Any] = {
+                "timeout": self._timeout(settings),
+                "trust_env": False,
+                # No connection is kept alive between requests.  A socket the
+                # upstream or the proxy closed without telling us looks reusable
+                # right up until a request stalls on it, and that stall is what
+                # the client sees as "wait for response, first token never
+                # comes".  Retiring every connection at the end of its request
+                # costs one handshake (tens of ms through a local proxy) and
+                # removes the entire class of stale-socket failures.  Streaming
+                # still works: a single request's connection lives for the whole
+                # stream; it is only *reuse across requests* that is disabled.
+                "limits": httpx.Limits(
+                    max_connections=64,
+                    max_keepalive_connections=0,
+                    keepalive_expiry=0.0,
+                ),
+            }
             if key != "direct":
                 kwargs["proxy"] = proxy
             client = httpx.AsyncClient(**kwargs)
@@ -1162,15 +1202,33 @@ class MiniMaxClient:
         return client
 
     @staticmethod
+    def _client_key(settings: Settings, host: str) -> str:
+        """The cache key one host maps to: proxied vs direct.
+
+        Loopback never goes through the proxy (see is_loopback); everything else
+        follows the configured proxy.  Factored out so a caller that needs to
+        discard a bad client can compute the same key the client was stored
+        under.
+        """
+        proxy = (settings.upstream.proxy or "").strip()
+        if proxy and not is_loopback(host):
+            return f"proxy:{proxy}"
+        return "direct"
+
+    @staticmethod
     def _timeout(settings: Settings) -> httpx.Timeout:
         # The connect side is short and the read side generous: a stream turn can
         # legitimately take minutes to produce its first token, while a proxy or
-        # DNS failure should surface immediately.
+        # DNS failure should surface immediately.  The pool wait is generous on
+        # purpose: a burst of registrations all egress through one proxy, and a
+        # request that briefly has no free connection should wait rather than
+        # fail — a `PoolTimeout` here once cost a freshly registered account its
+        # only import attempt.
         return httpx.Timeout(
             connect=15.0,
             read=float(settings.upstream.request_timeout_sec),
             write=30.0,
-            pool=30.0,
+            pool=90.0,
         )
 
     def _headers(self, settings: Settings, cred: Credential, target: Target) -> dict[str, str]:
@@ -1231,7 +1289,16 @@ class MiniMaxClient:
                 "write": 30.0,
                 "pool": 30.0,
             }
-        return await client.send(request, stream=stream)
+        # Same header-wait bound as `llm`: a stale keep-alive socket must fail
+        # fast rather than hold the request until the read timeout.
+        header_budget = min(45.0, float(timeout)) if timeout else 45.0
+        try:
+            return await asyncio.wait_for(client.send(request, stream=stream), timeout=header_budget)
+        except asyncio.TimeoutError as err:
+            await self._drop_client(self._client_key(settings, host))
+            raise UpstreamError(
+                f"upstream sent no response headers within {header_budget:.0f}s"
+            ) from err
 
     async def _read_json(self, cred: Credential, target: Target, label: str) -> dict[str, Any]:
         """Issue a signed JSON call and decode the envelope."""
@@ -1244,6 +1311,21 @@ class MiniMaxClient:
             # with an empty body, and that emptiness is its only signal.
             if response.status_code in (401, 403):
                 raise InvalidCredential(f"minimax {label} HTTP {response.status_code}")
+            # A redirect is not an answer.  The upstream occasionally 307s the
+            # identity endpoints to its other deployment (`.io` → `.com`), which
+            # leaves an empty body; falling through made that read as a plain
+            # "not JSON" and cost a freshly registered account its import, when
+            # the real cause was a host that will not serve a foreign token.
+            # Reported as a transport error, so the caller retries (and the
+            # pending-signup recovery picks it up) instead of declaring the
+            # account dead.
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("location", "")
+                raise UpstreamError(
+                    f"minimax {label} redirected ({response.status_code}"
+                    f"{' -> ' + location if location else ''}); "
+                    f"the endpoint moved and this token does not apply there"
+                )
             raw = (await response.aread()).decode("utf-8", "replace")
             if response.status_code >= 400:
                 raise UpstreamError(f"minimax {label} HTTP {response.status_code}: {_snippet(raw)}")

@@ -265,6 +265,22 @@ class Pool:
             if idle:
                 candidates = idle
 
+        ordered = self._order_by_strategy(candidates, routing)
+
+        # Region priority is a stable re-partition *after* the strategy has
+        # ordered everything: the preferred region's accounts move to the front,
+        # and within each group the strategy's order is preserved.  Done this
+        # way rather than as another strategy so it composes with all of them —
+        # "least busy, but cn first" and "round-robin, but cn first" both work
+        # without duplicating the ordering logic per strategy.
+        preferred = (getattr(routing, "region_priority", "") or "").strip()
+        if preferred:
+            first = [a for a in ordered if a.region == preferred]
+            rest = [a for a in ordered if a.region != preferred]
+            return first + rest
+        return ordered
+
+    def _order_by_strategy(self, candidates: list[Account], routing: Any) -> list[Account]:
         if routing.strategy == "priority":
             return sorted(candidates, key=lambda account: -account.priority)
         if routing.strategy == "round_robin":

@@ -93,6 +93,10 @@ class Trace:
     latency_ms: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Milliseconds from the request starting to the first byte of the answer.
+    # Previously left at 0, which hid whether "wait for response" was the
+    # upstream thinking slowly or a connection that never spoke at all.
+    first_token_ms: int = 0
     status: int = 200
     outcome: str = AUDIT_OK
     error: str = ""
@@ -117,6 +121,7 @@ class Trace:
             status=self.status,
             outcome=self.outcome,
             latency_ms=self.latency_ms,
+            first_token_ms=self.first_token_ms,
             prompt_tokens=self.prompt_tokens,
             completion_tokens=self.completion_tokens,
             stream=self.stream,
@@ -176,10 +181,27 @@ class Gateway:
     async def health(self) -> dict[str, Any]:
         usable = self._pool.usable_count()
         settings = self._settings_fn()
+        # Break the pool down so "usable" is not a bare number an operator has to
+        # guess at.  A pool of 61 showing "3 usable" is alarming; knowing that
+        # 58 are *disabled* and 2 are cooling down tells them which lever to pull.
+        accounts = self._pool.accounts()
+        now = time.time()
+        cooling = [
+            a for a in accounts
+            if a.enabled and a.status == "cooldown" and a.cooldown_until > now
+        ]
         return {
             "status": "ok" if usable else "degraded",
-            "accounts": len(self._pool.accounts()),
+            "accounts": len(accounts),
             "usableAccounts": usable,
+            # Enabled but unusable because of a temporary cooldown, with the
+            # soonest one back so the console can say "back in N min".
+            "coolingDown": len(cooling),
+            "nextCooldownEndsInSec": (
+                int(min(a.cooldown_until for a in cooling) - now) if cooling else 0
+            ),
+            # Enabled but retired (invalid) — needs a re-auth, not waiting on.
+            "disabled": sum(1 for a in accounts if not a.enabled),
             "signinEnabled": settings.signin.enabled,
             "upstream": settings.upstream.base_url,
             "time": int(time.time()),
@@ -349,6 +371,8 @@ class Gateway:
             frames = _tap_usage(frames, note_usage)
         try:
             async for frame in frames:
+                if not trace.first_token_ms:
+                    trace.first_token_ms = int((time.time() - trace.started_at) * 1000)
                 yield frame
         except BaseException as err:  # noqa: BLE001 - partial output already sent
             trace.finish(status=502, error=err)

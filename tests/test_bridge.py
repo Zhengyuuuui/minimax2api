@@ -1339,7 +1339,8 @@ def test_credit_refresh_reads_stale_but_not_fresh_accounts():
                 "never": Account(id="never", enabled=True, status=STATUS_ACTIVE),
                 # Disabled, but still worth a read: parked, not hidden.
                 "off": Account(id="off", enabled=False, status=STATUS_ACTIVE),
-                # The mainland deployment has no such endpoint to read.
+                # A mainland account is read too: its commerce endpoint answers
+                # on the cn host, so skipping it only left a stale balance shown.
                 "cn": Account(id="cn", enabled=True, status=STATUS_ACTIVE, region=REGION_CN),
             }
             self.saved = []
@@ -1384,9 +1385,9 @@ def test_credit_refresh_reads_stale_but_not_fresh_accounts():
     service = signin_mod.SigninService(db, _Pool(), client, lambda: _Holder())
 
     summary = asyncio.run(service.refresh_credits())
-    assert summary["refreshed"] == 3  # stale + never + disabled
-    assert summary["skipped"] == 2  # fresh + cn
-    assert set(db.saved) == {"stale", "never", "off"}
+    assert summary["refreshed"] == 4  # stale + never + disabled + cn
+    assert summary["skipped"] == 1  # fresh only
+    assert set(db.saved) == {"stale", "never", "off", "cn"}
     assert db.accounts["fresh"].credit.total == 10  # untouched
 
     # A named account is read even though its snapshot is fresh.
@@ -1806,7 +1807,11 @@ class _RenewableSigninHarness:
         async def _renewer(account_id):
             self.renew_calls += 1
             if not self._renewable:
-                return None
+                # A renewal that ran and was *refused* (not a transport blip):
+                # the credential is genuinely dead, so the outcome is a failure.
+                from app.keepalive import RenewResult
+
+                return RenewResult(ok=False, error="refresh and password both refused")
             self.account.token = "new"
 
             class _R:
@@ -1917,11 +1922,22 @@ def test_checkin_reports_failure_when_renewed_token_is_still_refused():
     assert "even after renewal" in outcome.reason
 
 
-def test_mainland_account_skips_before_any_credential_check():
-    """A CN account is never renewed for check-in; there is nothing to check into."""
+def test_mainland_checkin_disabled_by_setting_is_skipped():
+    """A cn account checks in like any other; the switch can still skip it.
+
+    The mainland deployment answers the same status/claim endpoints now, so the
+    default is to check cn accounts in.  The gate exists for an operator whose
+    mainland accounts genuinely cannot, and it must skip *before* any credential
+    work — a skip is not a request.
+    """
     h = _RenewableSigninHarness()
+    from app.config import SigninSettings
     from app.records import REGION_CN
 
+    class _Holder:
+        signin = SigninSettings(timeout_sec=5, gap_seconds=0, check_in_cn=False)
+
+    h.service._settings_fn = lambda: _Holder()
     h.account.region = REGION_CN
     outcome = asyncio.run(h.service.run_account(h.account))
     assert outcome.status == signin_mod.SIGNIN_SKIPPED
@@ -2252,3 +2268,386 @@ def test_merge_builtin_models_retires_a_builtin_no_longer_offered():
     ids = {m.id for m in models}
     assert "minimax-m2.7" not in ids
     assert "my-model" in ids
+
+
+def test_network_failure_markers_classify_reasons():
+    """Only network-shaped failures count toward the egress alert."""
+    from app.signin import Outcome, SIGNIN_FAILED, SIGNIN_ALREADY, _is_network_failure
+
+    assert _is_network_failure(Outcome("a", "a", status=SIGNIN_FAILED, reason="prepare timed out after 90s"))
+    assert _is_network_failure(Outcome("a", "a", status=SIGNIN_FAILED, reason="connection reset by peer"))
+    assert _is_network_failure(Outcome("a", "a", status=SIGNIN_FAILED, reason="upstream error 503"))
+    # Business failures are not the network's fault.
+    assert not _is_network_failure(Outcome("a", "a", status=SIGNIN_FAILED, reason="claim succeeded but no grant"))
+    assert not _is_network_failure(Outcome("a", "a", status=SIGNIN_ALREADY, reason="already checked in today"))
+    assert not _is_network_failure(Outcome("a", "a", status=SIGNIN_FAILED, reason="credential refused, not renewable"))
+
+
+def test_run_daily_includes_disabled_accounts():
+    """A disabled account is still signed in: its daily credit is free and expires.
+
+    Disabling removes an account from serving traffic; it does not make the
+    check-in entitlement go away.  The old `if not enabled: continue` left a pool
+    of accounts looking dead only because nobody signed them in.
+    """
+    from app import signin as signin_mod
+    from app.records import STATUS_ACTIVE, Account, SIGNIN_OK
+
+    accounts = [
+        Account(id="on", name="on", enabled=True, status=STATUS_ACTIVE, token="t", agent_id="1"),
+        Account(id="off", name="off", enabled=False, status=STATUS_ACTIVE, token="t", agent_id="1"),
+    ]
+
+    class _DB:
+        async def list_accounts(self):
+            return accounts
+
+        async def save_account_state(self, account_id, apply_fn):
+            target = next(a for a in accounts if a.id == account_id)
+            apply_fn(target)
+            return target
+
+    class _Pool:
+        async def note_saved(self, account):
+            return None
+
+    class _Holder:
+        from app.config import SigninSettings
+
+        signin = SigninSettings(timeout_sec=5, gap_seconds=0)
+
+    service = signin_mod.SigninService(_DB(), _Pool(), object(), lambda: _Holder())
+
+    seen = []
+
+    async def _run_account(account):
+        seen.append(account.id)
+        return signin_mod.Outcome(account.id, account.name, status=SIGNIN_OK)
+
+    service.run_account = _run_account  # type: ignore[assignment]
+
+    run = asyncio.run(service.run_daily())
+    assert set(seen) == {"on", "off"}
+    assert {o.account_id for o in run.outcomes} == {"on", "off"}
+
+
+def test_run_account_treats_timeout_as_a_failed_account():
+    """A bare TimeoutError from the status/claim call fails one account, not the run."""
+    from app import signin as signin_mod
+    from app.records import STATUS_ACTIVE, Account, SIGNIN_FAILED
+
+    account = Account(id="a", name="a", enabled=True, status=STATUS_ACTIVE, token="t", agent_id="1")
+
+    class _DB:
+        def __init__(self):
+            self.saved = None
+
+        async def save_account_state(self, account_id, apply_fn):
+            apply_fn(account)
+            self.saved = account
+            return account
+
+        async def account_by_id(self, account_id):
+            return account
+
+    class _Pool:
+        async def note_saved(self, account):
+            return None
+
+    class _Holder:
+        from app.config import SigninSettings
+
+        signin = SigninSettings(timeout_sec=5, gap_seconds=0)
+
+    class _Client:
+        async def signin_status(self, credential):
+            raise asyncio.TimeoutError()
+
+    service = signin_mod.SigninService(_DB(), _Pool(), _Client(), lambda: _Holder())
+
+    async def _attempt(_account):
+        raise asyncio.TimeoutError()
+
+    service._attempt = _attempt  # type: ignore[assignment]
+
+    outcome = asyncio.run(service.run_account(account))
+    assert outcome.status == SIGNIN_FAILED
+    assert "timeout" in outcome.reason.lower()
+
+
+def test_import_identity_retries_transient_and_stops_on_business_error():
+    """A PoolTimeout is retried; a refused credential is not."""
+    import asyncio
+    import httpx
+
+    from app import admin as admin_mod
+    from app import upstream
+
+    class _Client:
+        def __init__(self, outcomes):
+            self.outcomes = list(outcomes)
+            self.calls = 0
+
+        async def fetch_user_info(self, credential):
+            self.calls += 1
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    class _Service:
+        client = None
+
+    # 1) transient errors then success on the third try
+    service = _Service()
+    service.client = _Client([httpx.PoolTimeout("pool"), httpx.ConnectError("net"), {"real_user_id": "u"}])
+    result = asyncio.run(admin_mod.AdminService._discover_identity(service, object()))
+    assert result == {"real_user_id": "u"}
+    assert service.client.calls == 3
+
+    # 2) a business-level refusal is an answer, not a retry
+    service2 = _Service()
+    service2.client = _Client([upstream.UpstreamError("bad session"), {"real_user_id": "u"}])
+    result2 = asyncio.run(admin_mod.AdminService._discover_identity(service2, object()))
+    assert isinstance(result2, admin_mod.ImportResult) and not result2.ok
+    assert service2.client.calls == 1
+
+
+def test_is_transient_only_matches_transport_errors():
+    import httpx
+
+    from app.admin import _is_transient
+
+    assert _is_transient(httpx.PoolTimeout("x"))
+    assert _is_transient(httpx.ConnectError("x"))
+    assert _is_transient(httpx.ReadTimeout("x"))
+    assert not _is_transient(ValueError("x"))
+
+
+def test_run_daily_survives_an_account_that_hangs():
+    """One hung account must fail that account, not freeze the whole run.
+
+    A stuck renewer (or any await that never returns) used to hold `_running`
+    True forever: the next day's run never started and the only cure was a
+    restart.  The per-account budget turns that into a single skipped account.
+    """
+    import asyncio
+    import time
+
+    from app import signin as signin_mod
+    from app.config import SigninSettings
+    from app.records import STATUS_ACTIVE, Account, SIGNIN_FAILED
+
+    slow = Account(id="slow", name="slow", enabled=True, status=STATUS_ACTIVE, token="t", agent_id="1")
+    fast = Account(id="fast", name="fast", enabled=True, status=STATUS_ACTIVE, token="t", agent_id="1")
+
+    class _DB:
+        async def list_accounts(self):
+            return [slow, fast]
+
+        async def save_account_state(self, account_id, apply_fn):
+            return None
+
+    class _Pool:
+        async def note_saved(self, account):
+            return None
+
+    class _Holder:
+        signin = SigninSettings(timeout_sec=1, gap_seconds=0)
+
+    service = signin_mod.SigninService(_DB(), _Pool(), object(), lambda: _Holder())
+
+    async def _run_account(account):
+        if account.id == "slow":
+            await asyncio.sleep(3600)  # never returns within the budget
+        return signin_mod.Outcome(account.id, account.name, status=signin_mod.SIGNIN_OK)
+
+    service.run_account = _run_account  # type: ignore[assignment]
+    # Pin the budget tiny so the test does not wait the real ceiling.
+    service._account_budget = staticmethod(lambda settings: 1.0)  # type: ignore[assignment]
+
+    started = time.monotonic()
+    run = asyncio.run(service.run_daily())
+    elapsed = time.monotonic() - started
+
+    # The slow account is failed and skipped; the fast one still ran.
+    by_id = {o.account_id: o for o in run.outcomes}
+    assert by_id["slow"].status == SIGNIN_FAILED and "budget" in by_id["slow"].reason
+    assert by_id["fast"].status == signin_mod.SIGNIN_OK
+    assert elapsed < 30  # did not wait for the hour-long sleep
+
+
+def test_checkin_skips_when_renewal_hits_a_network_blip():
+    """A renewal that could not reach the network is a skip, not a failure.
+
+    The keepalive marks transport failures `transient` on purpose: the proxy
+    blinked, the credential was never judged.  Check-in must not turn that into
+    "not renewable" — that marked healthy accounts failed whenever the network
+    hiccuped mid-renewal, and they stopped being retried.
+    """
+    from app.keepalive import RenewResult
+
+    h = _RenewableSigninHarness()
+
+    async def _transient_renew(account_id):
+        h.renew_calls += 1
+        return RenewResult(ok=False, transient=True, error="ConnectError: SSL hostname mismatch")
+
+    h.service.renewer = _transient_renew
+    outcome = asyncio.run(h.service.run_account(h.account))
+    assert outcome.status == signin_mod.SIGNIN_SKIPPED
+    assert "network" in outcome.reason
+
+
+def _catchup_harness(accounts, *, probe_status=None):
+    """Build a SigninService with a stubbed DB/run_account for catch-up tests."""
+    import asyncio
+    from app import signin as signin_mod
+    from app.config import SigninSettings
+
+    class _DB:
+        async def list_accounts(self):
+            return accounts
+
+    class _Pool:
+        async def note_saved(self, account):
+            return None
+
+    class _Holder:
+        signin = SigninSettings(timeout_sec=5, gap_seconds=0, catchup_enabled=True)
+
+    service = signin_mod.SigninService(_DB(), _Pool(), object(), lambda: _Holder())
+    calls = {"probe": 0, "daily": 0}
+
+    async def _run_account(account):
+        calls["probe"] += 1
+        status = probe_status or signin_mod.SIGNIN_OK
+        return signin_mod.Outcome(account.id, account.name, status=status)
+
+    async def _run_daily(account_ids=None):
+        calls["daily"] += 1
+        return signin_mod._Run()
+
+    service.run_account = _run_account  # type: ignore[assignment]
+    service.run_daily = _run_daily  # type: ignore[assignment]
+    return service, calls
+
+
+def test_catchup_skips_when_someone_already_checked_in_today():
+    """One ok/already today means the scheduled pass ran; no catch-up."""
+    import asyncio
+    import time
+    from app.records import STATUS_ACTIVE, Account, SIGNIN_OK
+
+    now = time.time()
+    accounts = [
+        Account(id="a", name="a", enabled=True, status=STATUS_ACTIVE, token="t", agent_id="1",
+                signin_at=now, signin_status=SIGNIN_OK),
+        Account(id="b", name="b", enabled=True, status=STATUS_ACTIVE, token="t", agent_id="1",
+                signin_at=0, signin_status=""),
+    ]
+    service, calls = _catchup_harness(accounts)
+    assert asyncio.run(service._today_covered()) is True
+    # _today_covered alone must be the gate; no probe should be needed.
+
+
+def test_catchup_treats_failures_today_as_not_covered():
+    """A day where every account failed books nothing — that is a missed run."""
+    import asyncio
+    import time
+    from app.records import STATUS_ACTIVE, Account, SIGNIN_FAILED
+
+    now = time.time()
+    accounts = [
+        Account(id="a", name="a", enabled=True, status=STATUS_ACTIVE, token="t", agent_id="1",
+                signin_at=now, signin_status=SIGNIN_FAILED),
+    ]
+    service, _ = _catchup_harness(accounts)
+    assert asyncio.run(service._today_covered()) is False
+
+
+def test_catchup_probe_failure_does_not_run_full_pass():
+    """A still-broken network fails the probe; the pool is left alone."""
+    import asyncio
+    from app.records import STATUS_ACTIVE, Account, SIGNIN_FAILED
+
+    accounts = [
+        Account(id="a", name="a", enabled=True, status=STATUS_ACTIVE, token="t", agent_id="1"),
+    ]
+    service, calls = _catchup_harness(accounts, probe_status=SIGNIN_FAILED)
+    asyncio.run(service._catchup_once())
+    assert calls["probe"] == 1
+    assert calls["daily"] == 0
+    assert (service._last_catchup or {}).get("ok") is False
+
+
+def test_catchup_probe_success_runs_full_pass():
+    """A healthy probe triggers the whole-pool catch-up."""
+    import asyncio
+    from app.records import STATUS_ACTIVE, Account, SIGNIN_OK
+
+    accounts = [
+        Account(id="a", name="a", enabled=True, status=STATUS_ACTIVE, token="t", agent_id="1"),
+    ]
+    service, calls = _catchup_harness(accounts, probe_status=SIGNIN_OK)
+    asyncio.run(service._catchup_once())
+    assert calls["probe"] == 1
+    assert calls["daily"] == 1
+    assert (service._last_catchup or {}).get("ok") is True
+
+
+def test_region_priority_puts_preferred_region_first_but_keeps_fallback():
+    """region_priority reorders, it does not filter.
+
+    Preferring cn must not hide global: when no cn account is routable a request
+    still has to go somewhere.  And within each group the chosen strategy's
+    order is preserved, so "prefer cn" composes with least_inflight rather than
+    replacing it.
+    """
+    from app import pool as pool_mod
+    from app.config import Settings
+    from app.records import STATUS_ACTIVE, Account
+
+    class _DB:
+        def __init__(self, accounts):
+            self._accounts = {a.id: a for a in accounts}
+
+        async def list_accounts(self):
+            return list(self._accounts.values())
+
+        async def save_account_state(self, account_id, fn):
+            return None
+
+    accounts = [
+        Account(id="g1", name="g1", region="global", enabled=True, status=STATUS_ACTIVE, token="t"),
+        Account(id="c1", name="c1", region="cn", enabled=True, status=STATUS_ACTIVE, token="t"),
+        Account(id="g2", name="g2", region="global", enabled=True, status=STATUS_ACTIVE, token="t"),
+    ]
+
+    def settings(prefer):
+        s = Settings()
+        s.routing.strategy = "least_inflight"
+        s.routing.prefer_idle = False
+        s.routing.region_priority = prefer
+        return s
+
+    class _Holder:
+        def __init__(self, s):
+            self._s = s
+
+        def settings(self):
+            return self._s
+
+    # Prefer cn: the cn account comes first, the globals follow.
+    p = pool_mod.Pool(_DB(accounts), _Holder(settings("cn")).settings)
+    asyncio.run(p.load())
+    ranked = [a.id for a in p._ranked(set(), None)]
+    assert ranked[0] == "c1", ranked
+    assert set(ranked) == {"c1", "g1", "g2"}
+
+    # No preference: strategy's own order, region-agnostic.
+    p2 = pool_mod.Pool(_DB(accounts), _Holder(settings("")).settings)
+    asyncio.run(p2.load())
+    assert set(a.id for a in p2._ranked(set(), None)) == {"c1", "g1", "g2"}
+
+

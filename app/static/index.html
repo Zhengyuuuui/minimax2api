@@ -85,6 +85,12 @@
   button.ghost { background: none; border: 1px solid var(--edge); color: var(--text); }
   button.small { padding: 3px 8px; font-size: 12px; }
   button.danger { background: var(--bad); }
+  /* Enable / disable actions are opposites; give each a colour so the pair is
+     distinguishable at a glance instead of two identical grey ghost buttons. */
+  button.start { background: color-mix(in srgb, var(--ok) 22%, transparent); border: 1px solid var(--ok); color: var(--ok); }
+  button.start:hover { background: color-mix(in srgb, var(--ok) 34%, transparent); }
+  button.stop { background: color-mix(in srgb, var(--bad) 20%, transparent); border: 1px solid var(--bad); color: var(--bad); }
+  button.stop:hover { background: color-mix(in srgb, var(--bad) 32%, transparent); }
   button[disabled] { opacity: .5; cursor: not-allowed; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 11px; border: 1px solid var(--edge); color: var(--muted); }
   .pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
@@ -94,6 +100,36 @@
   .tiny { font-size: 11px; }
   .stale { color: var(--bad); }
   .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+  .hint {
+    border: 1px solid var(--edge); border-left: 3px solid var(--accent);
+    border-radius: 7px; padding: 10px 12px; background: color-mix(in srgb, var(--accent) 7%, transparent);
+  }
+  .hint pre {
+    margin: 8px 0 6px; padding: 8px 10px; overflow-x: auto;
+    background: var(--bg, rgb(0 0 0 / .12)); border: 1px solid var(--edge); border-radius: 6px;
+  }
+  .hint code { font-family: ui-monospace, monospace; font-size: 12px; }
+  .warn-banner {
+    margin: 0 0 12px; padding: 10px 12px; border-radius: 7px;
+    background: color-mix(in srgb, var(--bad) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--bad) 55%, transparent);
+    color: var(--text); font-size: 13px; line-height: 1.5;
+  }
+  .warn-banner b { color: var(--bad); }
+  .home-signin {
+    margin: 0 0 12px; padding: 10px 12px; border-radius: 7px;
+    background: color-mix(in srgb, var(--ok) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
+  }
+  .signin-feed {
+    margin-top: 8px; max-height: 150px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 2px; font-size: 12px;
+  }
+  .signin-feed .line { display: flex; justify-content: space-between; gap: 10px; }
+  .signin-feed .line .nm { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .signin-feed .ok { color: var(--ok); }
+  .signin-feed .already { color: var(--muted); }
+  .signin-feed .failed { color: var(--bad); }
   .flash {
     position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
     background: var(--panel); border: 1px solid var(--edge); border-radius: 9px;
@@ -133,7 +169,36 @@
   <section id="view-accounts" hidden>
     <div class="panel">
       <h2>概览</h2>
+      <div id="pool-warning" class="warn-banner" hidden></div>
+      <div id="home-signin" class="home-signin" hidden>
+        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
+          <span id="home-signin-label"><b>签到进行中</b></span>
+          <span id="home-signin-count" class="mono muted"></span>
+        </div>
+        <div style="height:8px;border-radius:99px;background:color-mix(in srgb,var(--edge) 60%,transparent);overflow:hidden">
+          <div id="home-signin-bar" style="height:100%;width:0;background:var(--ok);transition:width .3s"></div>
+        </div>
+        <div id="home-signin-tally" class="tiny muted" style="margin-top:4px"></div>
+        <div id="home-signin-feed" class="signin-feed"></div>
+      </div>
       <div class="grid" id="stats-grid"></div>
+    </div>
+    <div class="panel">
+      <h2>区域调度</h2>
+      <p class="muted" style="margin-top:0">
+        优先消耗哪个区域的账号积分。设为某区域后，该区域账号排在前面，另一区域作为后备——不会因缺某区账号而失败。
+      </p>
+      <div class="row">
+        <div style="flex:0 0 auto"><label>优先区域</label>
+          <select id="region-priority">
+            <option value="">不区分（按策略轮询）</option>
+            <option value="cn">优先国内（cn）积分</option>
+            <option value="global">优先海外（global）积分</option>
+          </select>
+        </div>
+        <div style="flex:0 0 auto;align-self:flex-end"><button id="region-priority-save">保存</button></div>
+      </div>
+      <p class="muted" style="font-size:12px;margin:10px 0 0" id="region-priority-line"></p>
     </div>
     <div class="panel">
       <h2>近期请求</h2>
@@ -155,34 +220,6 @@
         <div style="flex:0 0 auto"><label>&nbsp;</label><button id="device-cancel" class="ghost" hidden>取消</button></div>
       </div>
       <div id="device-status" style="margin-top:10px"></div>
-    </div>
-    <div class="panel">
-      <h2>无头注册 <span class="muted">（海外版）</span></h2>
-      <p class="muted" style="margin-top:0">
-        全程无浏览器：自动申请临时邮箱 → 收验证码 → 注册 → 用会话直接批准设备码 → 拿 OAuth token 入池。
-        仅支持海外版（<code>account.minimax.io</code>）。
-      </p>
-      <div class="row">
-        <div style="flex:1;min-width:220px"><label>邮箱服务 API 地址</label><input id="signup-mail-base" placeholder="https://xxx.workers.dev"></div>
-        <div style="flex:0 0 auto"><label>邮箱域名</label><input id="signup-mail-domain" placeholder="example.com" style="width:170px"></div>
-      </div>
-      <div class="row" style="margin-top:8px">
-        <div style="flex:0 0 auto"><label>Admin Passkey</label>
-          <span class="secret-field" style="width:220px">
-            <input id="signup-mail-pass" type="password" autocomplete="new-password" placeholder="管理密钥">
-            <button type="button" class="ghost reveal" data-reveal="signup-mail-pass">显示</button>
-          </span>
-        </div>
-        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="signup-mail-save" class="ghost">保存邮箱配置</button></div>
-      </div>
-      <div class="row" style="margin-top:12px">
-        <div><label>账号名称（可选）</label><input id="signup-name" placeholder="例如：批量号"></div>
-        <div><label>数量</label><input id="signup-count" type="number" min="1" max="20" value="1" style="width:80px"></div>
-        <div><label>初始密码（可选）</label><input id="signup-password" type="text" placeholder="留空则用默认密码"></div>
-        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="signup-start">开始注册</button></div>
-        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="signup-cancel" class="ghost" hidden>取消</button></div>
-      </div>
-      <div id="signup-status" style="margin-top:10px"></div>
     </div>
     <div class="panel">
       <h2>代理池 <span id="proxy-count" class="muted"></span></h2>
@@ -269,11 +306,25 @@ b@example.com----Password456"></textarea>
       <h2>每日签到</h2>
       <div class="row">
         <div><label>启用</label><input type="checkbox" id="signin-enabled" style="width:auto"></div>
+        <div><label>大陆号也签到</label><input type="checkbox" id="signin-cn" style="width:auto"></div>
         <div><label>执行时间</label><input id="signin-time" placeholder="09:05" value="09:05"></div>
         <div><label>账号间隔（秒）</label><input id="signin-gap" type="number" min="0" value="2"></div>
+        <div><label>错过后自动补签</label><input type="checkbox" id="signin-catchup" style="width:auto"></div>
+        <div><label>补签检查间隔（分钟）</label><input id="signin-catchup-min" type="number" min="1" value="15"></div>
         <div><label>&nbsp;</label><button id="signin-save">保存</button> <button id="signin-run" class="ghost">立即运行</button></div>
       </div>
       <p class="muted" style="font-size:12px;margin:10px 0 0" id="signin-status-line"></p>
+      <div id="signin-progress" hidden style="margin-top:8px">
+        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
+          <span id="signin-progress-label" class="muted"></span>
+          <span id="signin-progress-count" class="muted mono"></span>
+        </div>
+        <div style="height:8px;border-radius:99px;background:color-mix(in srgb,var(--edge) 60%,transparent);overflow:hidden">
+          <div id="signin-progress-bar" style="height:100%;width:0;background:var(--ok);transition:width .3s"></div>
+        </div>
+        <div id="signin-progress-tally" class="tiny muted" style="margin-top:4px"></div>
+      </div>
+      <p class="muted" style="font-size:12px;margin:6px 0 0" id="signin-catchup-line"></p>
     </div>
     <div class="panel">
       <h2>余额刷新</h2>
@@ -378,6 +429,7 @@ const state = {
   audits: { offset: 0, limit: 50, total: 0, model: "", outcome: "" },
   accounts: [],
   videoModels: [],
+  homeSigninTimer: null,
 };
 
 function flash(message, kind = "ok") {
@@ -505,6 +557,14 @@ function statusCell(account) {
     return pill("需续期凭据", "bad") +
       `<br><span class="tiny muted" title="没有 refresh_token，也没有邮箱+密码">不可续期</span>`;
   }
+  if (account.status === "cooldown") {
+    // "Cooling" without a clock is what leaves an operator staring at a pool
+    // that looks dead. Say how long until it is back.
+    const until = account.cooldownUntil ? new Date(account.cooldownUntil).getTime() : 0;
+    const left = until - Date.now();
+    const note = left > 0 ? `${Math.ceil(left / 60000)} 分后恢复` : "即将恢复";
+    return pill("冷却中", "warn") + `<br><span class="tiny muted">${note}</span>`;
+  }
   return statusPill(account.status);
 }
 
@@ -566,12 +626,80 @@ async function render() {
 async function renderDashboard() {
   const [stats, health] = await Promise.all([api("/admin/api/stats"), api("/health")]);
   const totals = stats.totals || {};
+
+  // A pool with no routable account is the single most confusing failure: the
+  // model just "waits for response" and nothing says why.  Lead with it, and say
+  // which lever moves each bucket (enable / wait / re-auth).
+  const usable = health.usableAccounts ?? 0;
+  const disabled = health.disabled ?? 0;
+  const cooling = health.coolingDown ?? 0;
+  const banner = $("#pool-warning");
+  if (usable === 0) {
+    const back = health.nextCooldownEndsInSec > 0
+      ? `，最近的冷却 ${Math.ceil(health.nextCooldownEndsInSec / 60)} 分后结束`
+      : "";
+    banner.hidden = false;
+    banner.innerHTML = `<b>⚠ 没有可用账号</b> —— 请求会一直 wait for response 直到超时。`
+      + ` 共 ${health.accounts ?? 0} 个：停用 ${disabled} 个、冷却中 ${cooling} 个${back}。`
+      + ` 请到「号池」启用账号，或等待冷却结束。`;
+  } else if (usable <= 2) {
+    banner.hidden = false;
+    banner.innerHTML = `<b>⚠ 可用账号偏少（${usable} 个）</b> —— 并发请求会排队变慢。`
+      + ` 停用 ${disabled} 个、冷却中 ${cooling} 个。`;
+  } else {
+    banner.hidden = true;
+  }
+
+  // Sign-in progress on the home page: the run can take minutes and lives on
+  // another tab, so surface it here without the operator hunting for it.
+  try {
+    const signin = await api("/admin/api/signin");
+    const prog = signin.progress || {};
+    const box = $("#home-signin");
+    if (signin.running && (prog.total || 0) > 0) {
+      const total = prog.total || 0;
+      const done = prog.done || 0;
+      const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+      box.hidden = false;
+      $("#home-signin-bar").style.width = pct + "%";
+      $("#home-signin-count").textContent = done + " / " + total + "（" + pct + "%）";
+      $("#home-signin-label").innerHTML = prog.current
+        ? `<b>签到进行中</b> <span class="muted">· ${prog.current}</span>`
+        : `<b>签到进行中</b> <span class="muted">· 准备中…</span>`;
+      $("#home-signin-tally").textContent =
+        "成功 " + (prog.ok || 0) + " · 已签 " + (prog.already || 0) + " · 失败 " + (prog.failed || 0);
+      // Live feed: one line per finished account, newest on top — "签到成功 +1000"
+      // is what makes it obvious the run is moving, not just counting.
+      const recent = (prog.recent || []).slice().reverse();
+      $("#home-signin-feed").innerHTML = recent.map((o) => {
+        const st = o.status;
+        const label = st === "ok" ? "签到成功"
+          : st === "already" ? "今日已签"
+          : st === "failed" ? "签到失败" : "跳过";
+        const kind = st === "ok" ? "ok" : st === "failed" ? "failed" : "already";
+        const pts = st === "ok" && o.points ? ` +${o.points}` : "";
+        return `<div class="line"><span class="nm">${o.name || ""}</span>`
+          + `<span class="${kind}">${label}${pts}</span></div>`;
+      }).join("") || `<div class="muted tiny">等待第一个账号…</div>`;
+      // Keep refreshing while it runs so the bar moves on its own.
+      if (!state.homeSigninTimer) {
+        state.homeSigninTimer = setInterval(() => {
+          if (state.view === "accounts") renderDashboard().catch(() => {});
+          else { clearInterval(state.homeSigninTimer); state.homeSigninTimer = null; }
+        }, 2000);
+      }
+    } else {
+      box.hidden = true;
+      if (state.homeSigninTimer) { clearInterval(state.homeSigninTimer); state.homeSigninTimer = null; }
+    }
+  } catch (_) { /* signin status unavailable must not break the dashboard */ }
+
   const cards = [
     ["总请求", totals.requests ?? 0],
     ["成功", totals.successes ?? 0],
     ["失败", totals.failures ?? 0],
     ["平均延迟", (totals.avgLatencyMs ?? 0) + " ms"],
-    ["可用账号", (health.usableAccounts ?? 0) + " / " + (health.accounts ?? 0)],
+    ["可用账号", usable + " / " + (health.accounts ?? 0)],
     ["今日签到", health.signinEnabled ? "已启用" : "已关闭"],
   ];
   $("#stats-grid").innerHTML = cards
@@ -588,13 +716,22 @@ async function renderDashboard() {
   $("#recent-audits").innerHTML = body
     .map((cells) => row([cells[0], cells[1], cells[2], cells[3]]))
     .join("");
+
+  // Region scheduling: reflect the current preference in the card.
+  try {
+    const settings = await api("/admin/api/settings");
+    const prefer = (settings.routing && settings.routing.region_priority) || "";
+    $("#region-priority").value = prefer;
+    $("#region-priority-line").textContent = prefer
+      ? `当前：优先 ${prefer === "cn" ? "国内" : "海外"}，另一区域作为后备`
+      : "当前：不区分区域，按调度策略轮询";
+  } catch (_) { /* settings unavailable should not break the dashboard */ }
 }
 
 async function renderAccounts() {
   await renderDashboard();
   state.accounts = await api("/admin/api/accounts");
   await renderProxies();
-  await loadSignupMail();
   $("#account-count").textContent = "(" + state.accounts.length + ")";
   $("#accounts-body").innerHTML = state.accounts.map((account) => row([
     `<b>${account.name || account.id.slice(0, 8)}</b><br>${sourceBadge(account.source)}`,
@@ -615,7 +752,7 @@ async function renderAccounts() {
     signinCell(account),
     [
       `<button class="ghost small" data-act="probe" data-id="${account.id}">探测</button>`,
-      `<button class="ghost small" data-act="${account.enabled ? "disable" : "enable"}" data-id="${account.id}">${account.enabled ? "停用" : "启用"}</button>`,
+      `<button class="${account.enabled ? "stop" : "start"} small" data-act="${account.enabled ? "disable" : "enable"}" data-id="${account.id}">${account.enabled ? "停用" : "启用"}</button>`,
       account.status === "invalid"
         ? `<button class="ghost small" data-act="reset" data-id="${account.id}">恢复</button>`
         : "",
@@ -635,7 +772,7 @@ async function renderModels() {
     model.upstreamModel ? `<code>${model.upstreamModel}</code>` : `<span class="muted">-</span>`,
     model.requests,
     model.enabled ? pill("启用", "ok") : pill("停用", "bad"),
-    `<button class="ghost small" data-model-act="toggle" data-id="${model.id}">${model.enabled ? "停用" : "启用"}</button>`,
+    `<button class="${model.enabled ? "stop" : "start"} small" data-model-act="toggle" data-id="${model.id}">${model.enabled ? "停用" : "启用"}</button>`,
   ])).join("");
 }
 
@@ -643,11 +780,38 @@ async function renderSignin() {
   const status = await api("/admin/api/signin");
   const settings = await api("/admin/api/settings");
   $("#signin-enabled").checked = Boolean(settings.signin && settings.signin.enabled);
+  $("#signin-cn").checked = settings.signin ? settings.signin.check_in_cn !== false : true;
   $("#signin-time").value = (settings.signin ? settings.signin.hour : 9) + ":" + String(settings.signin ? settings.signin.minute : 5).padStart(2, "0");
   $("#signin-gap").value = settings.signin ? settings.signin.gap_seconds : 2;
+  $("#signin-catchup").checked = settings.signin ? settings.signin.catchup_enabled !== false : true;
+  $("#signin-catchup-min").value = settings.signin ? (settings.signin.catchup_interval_min ?? 15) : 15;
   $("#signin-status-line").textContent = status.running
     ? "正在运行…"
     : "下次运行：" + (status.nextRunAt || "-");
+
+  // Live progress: a serial pass over the pool takes minutes, so "running" alone
+  // looks like it is stuck.  Show done/total and the account being worked on.
+  const prog = status.progress || {};
+  const box = $("#signin-progress");
+  if (status.running && (prog.total || 0) > 0) {
+    const total = prog.total || 0;
+    const done = prog.done || 0;
+    const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+    box.hidden = false;
+    $("#signin-progress-bar").style.width = pct + "%";
+    $("#signin-progress-count").textContent = done + " / " + total + "（" + pct + "%）";
+    $("#signin-progress-label").textContent = prog.current ? "正在签到：" + prog.current : "准备中…";
+    $("#signin-progress-tally").textContent =
+      "成功 " + (prog.ok || 0) + " · 已签 " + (prog.already || 0) + " · 失败 " + (prog.failed || 0);
+  } else {
+    box.hidden = true;
+  }
+  const lc = status.lastCatchup;
+  $("#signin-catchup-line").textContent = lc
+    ? (lc.ok
+        ? "上次补签探针成功，已补签全部账号（" + timeAgo(new Date(lc.at * 1000).toISOString()) + "）"
+        : "上次补签探针失败：" + (lc.reason || "-") + "（" + timeAgo(new Date(lc.at * 1000).toISOString()) + "），下个间隔再试")
+    : "今天若错过定时签到（关机 / 代理波动），恢复后会自动探针一个账号并补签全部。";
 
   const credit = await api("/admin/api/credit");
   if (document.activeElement !== $("#credit-interval")) {
@@ -823,6 +987,7 @@ const SETTING_LABELS = {
   "upstream.screen_height": "屏幕高",
   "upstream.request_timeout_sec": "请求超时（秒）",
   "routing.strategy": "调度策略",
+  "routing.region_priority": "区域优先（空/cn/global）",
   "routing.max_attempts": "最多尝试账号数",
   "routing.cooldown_base_sec": "冷却基数（秒）",
   "routing.cooldown_max_sec": "冷却上限（秒）",
@@ -831,7 +996,7 @@ const SETTING_LABELS = {
   "audit.max_records": "审计最大条数",
   "media.auto_download": "自动下载素材",
   "media.max_total_size_mb": "素材目录上限（MB）",
-  "signup.enabled": "启用无头注册",
+  "signup.enabled": "启用有头浏览器注册",
   "signup.region": "注册区域（global/cn）",
   "signup.mail_base": "邮箱服务 API 地址",
   "signup.mail_domain": "邮箱域名",
@@ -839,7 +1004,7 @@ const SETTING_LABELS = {
   "signup.name_prefix": "邮箱/账号名前缀",
   "signup.mail_timeout_sec": "等待验证码超时（秒）",
   "signup.mail_poll_sec": "收件轮询间隔（秒）",
-  "signup.password": "新账号初始密码（可空）",
+  "signup.password": "新账号初始密码（留空=每号随机 12 位强密码）",
   "signup.use_proxies": "注册走代理池",
   "signup.per_ip_limit": "每出口 IP 注册上限",
   "signup.proxy_strategy": "代理选择策略（rotate/random/single）",
@@ -1021,147 +1186,6 @@ function renderDevice(session) {
 }
 
 /* --- headless registration: no browser, no click, poll the same way --------- */
-
-let signupTimer = null;
-let signupId = null;
-
-/* Mail config lives in the settings document, but this panel is where it is
-   used, so it is edited here too.  The passkey field is masked on arrival; a
-   blank submit leaves it unchanged (see the settings save path). */
-async function loadSignupMail() {
-  try {
-    const settings = await api("/admin/api/settings");
-    $("#signup-mail-base").value = settings.signup.mail_base || "";
-    $("#signup-mail-domain").value = settings.signup.mail_domain || "";
-    // The server answers a secret as the mask, never the value.  Putting the mask
-    // in the box is what makes an operator believe a real passkey is loaded when
-    // it is a placeholder; leaving it blank with a hint means "leave unchanged"
-    // is the honest state, and typing replaces it.
-    const pass = settings.signup.mail_pass || "";
-    const passInput = $("#signup-mail-pass");
-    const masked = (settings._secrets || []).includes("signup.mail_pass");
-    passInput.value = "";
-    passInput.placeholder = pass ? "已设置，留空则不变" : "管理密钥";
-    passInput.dataset.masked = masked ? "1" : "";
-    const locked = new Set(settings._locked || []);
-    for (const [id, key] of [["signup-mail-base", "signup.mail_base"], ["signup-mail-domain", "signup.mail_domain"], ["signup-mail-pass", "signup.mail_pass"]]) {
-      const input = $("#" + id);
-      if (input) input.disabled = locked.has(key);
-    }
-    $("#signup-mail-save").disabled = ["signup.mail_base", "signup.mail_domain", "signup.mail_pass"].some((k) => locked.has(k));
-  } catch (err) {
-    /* the settings tab reports its own errors; this is a convenience mirror */
-  }
-}
-
-$("#signup-mail-save").addEventListener("click", async () => {
-  try {
-    const payload = {
-      mail_base: $("#signup-mail-base").value.trim(),
-      mail_domain: $("#signup-mail-domain").value.trim(),
-    };
-    // Only send the passkey when the operator actually typed one: an empty box
-    // means "keep the stored value", so sending "" would clear it.
-    const pass = $("#signup-mail-pass").value;
-    if (pass) payload.mail_pass = pass;
-    await api("/admin/api/settings", { method: "POST", body: JSON.stringify({ signup: payload }) });
-    flash("邮箱配置已保存");
-    await loadSignupMail();
-  } catch (err) {
-    flash(err.message, "bad");
-  }
-});
-
-// The mail panel's reveal button is static, so it is wired once here; the
-// settings form wires its own because it is rebuilt on every render.
-$('.reveal[data-reveal="signup-mail-pass"]').addEventListener("click", (e) => revealSecret(e.currentTarget));
-
-$("#signup-start").addEventListener("click", async () => {
-  const button = $("#signup-start");
-  button.disabled = true;
-  $("#signup-status").innerHTML = '<span class="muted">正在创建邮箱并注册…</span>';
-  try {
-    const session = await api("/admin/api/signup", {
-      method: "POST",
-      body: JSON.stringify({
-        name: $("#signup-name").value.trim(),
-        region: "global",
-        count: parseInt($("#signup-count").value, 10) || 1,
-        password: $("#signup-password").value,
-      }),
-    });
-    signupId = session.id;
-    $("#signup-cancel").hidden = false;
-    renderSignup(session);
-    if (signupTimer) clearInterval(signupTimer);
-    signupTimer = setInterval(pollSignup, 2000);
-  } catch (err) {
-    $("#signup-status").innerHTML = `<span class="pill bad">失败</span> <span class="muted">${err.message}</span>`;
-  } finally {
-    button.disabled = false;
-  }
-});
-
-$("#signup-cancel").addEventListener("click", async () => {
-  if (!signupId) return;
-  try {
-    renderSignup(await api(`/admin/api/signup/${signupId}`, { method: "DELETE" }));
-  } catch (err) {
-    flash(err.message, "bad");
-  }
-});
-
-async function pollSignup() {
-  if (!signupId) return;
-  let session;
-  try {
-    session = await api(`/admin/api/signup/${signupId}`);
-  } catch (err) {
-    stopSignupPolling();
-    $("#signup-status").innerHTML = `<span class="pill bad">失败</span> <span class="muted">${err.message}</span>`;
-    return;
-  }
-  renderSignup(session);
-  if (session.status !== "pending") {
-    stopSignupPolling();
-    if (session.status === "registered") {
-      flash("已注册并入池：" + (session.registered || 1) + " 个（" + (session.accountName || session.email || session.accountId) + "）", "ok");
-      $("#signup-name").value = "";
-      await renderAccounts();
-      await renderProxies();
-    } else {
-      flash(session.error || "注册未完成", "bad");
-      await renderProxies();
-    }
-  }
-}
-
-function stopSignupPolling() {
-  if (signupTimer) clearInterval(signupTimer);
-  signupTimer = null;
-  $("#signup-cancel").hidden = true;
-}
-
-function renderSignup(session) {
-  const kind = { pending: "", registered: "ok", failed: "bad", canceled: "" };
-  const hints = {
-    canceled: "已取消。",
-    failed: "若提示网络/邮箱错误，先检查「设置」里的邮箱服务与 proxy（国际站锁海外出口）。",
-  };
-  const secs = Math.round((session.elapsedMs || 0) / 1000);
-  $("#signup-status").innerHTML = `
-    <div class="row" style="align-items:center">
-      <div style="flex:0 0 auto">${pill(session.status, kind[session.status] || "")}</div>
-      <div style="flex:0 0 auto" class="muted">${session.step || ""}</div>
-      <div style="flex:0 0 auto" class="muted">${session.email || ""}</div>
-      <div class="muted" style="flex:0 0 auto">${secs}s</div>
-    </div>
-    <p class="muted" style="font-size:12px;margin:8px 0 0">
-      ${session.accountName ? "已入池：" + session.accountName + "（" + session.accountId + "）" : ""}
-      ${session.error ? " " + session.error : ""}
-      ${hints[session.status] || ""}
-    </p>`;
-}
 
 /* --------------------------------------------------------------- proxy pool */
 
@@ -1414,6 +1438,19 @@ $("#models-body").addEventListener("click", async (event) => {
   }
 });
 
+$("#region-priority-save").addEventListener("click", async () => {
+  try {
+    await api("/admin/api/settings", {
+      method: "POST",
+      body: JSON.stringify({ routing: { region_priority: $("#region-priority").value } }),
+    });
+    flash("区域调度已保存");
+    await renderDashboard();
+  } catch (err) {
+    flash(err.message, "bad");
+  }
+});
+
 $("#signin-save").addEventListener("click", async () => {
   const [hour, minute] = $("#signin-time").value.split(":").map(Number);
   try {
@@ -1422,9 +1459,12 @@ $("#signin-save").addEventListener("click", async () => {
       body: JSON.stringify({
         signin: {
           enabled: $("#signin-enabled").checked,
+          check_in_cn: $("#signin-cn").checked,
           hour: Number.isFinite(hour) ? hour : 9,
           minute: Number.isFinite(minute) ? minute : 5,
           gap_seconds: Number($("#signin-gap").value || 0),
+          catchup_enabled: $("#signin-catchup").checked,
+          catchup_interval_min: Math.max(1, Number($("#signin-catchup-min").value || 15)),
           credit_refresh_min: Math.max(1, Number($("#credit-interval").value || 5)),
         },
       }),
@@ -1440,6 +1480,10 @@ $("#signin-run").addEventListener("click", async () => {
   const button = $("#signin-run");
   button.disabled = true;
   button.textContent = "签到中…";
+  // The POST blocks until the whole pass finishes, so poll the status endpoint
+  // alongside it to drive the progress bar; otherwise the button just sits there
+  // for minutes with no sign of life.
+  const poll = setInterval(() => { renderSignin().catch(() => {}); }, 2000);
   try {
     // The run takes tens of seconds (renewal included), so answer with its
     // results rather than "triggered": a green flash over failed claims is how
@@ -1452,12 +1496,13 @@ $("#signin-run").addEventListener("click", async () => {
     const bad = (c.failed || 0) + (c.unpaid || 0);
     const message = parts.join("，") + (bad ? `，失败 ${c.failed || 0}，未发放 ${c.unpaid || 0}` : "");
     flash(message, bad ? "bad" : "ok");
-    await renderSignin();
   } catch (err) {
     flash(err.message, "bad");
   } finally {
+    clearInterval(poll);
     button.disabled = false;
     button.textContent = "立即运行";
+    await renderSignin();
   }
 });
 

@@ -404,13 +404,9 @@ class AdminService:
 
         credential = upstream.credential_of(account)
         if discover:
-            try:
-                # One call for both credential kinds: the credential knows which
-                # header it authenticates with, and this endpoint is the only
-                # source of realUserID either way — it is in neither token.
-                identity = await self.client.fetch_user_info(credential)
-            except Exception as err:  # noqa: BLE001 - an unreachable token is a result, not a crash
-                return ImportResult(reason=_short(err))
+            identity = await self._discover_identity(credential)
+            if isinstance(identity, ImportResult):
+                return identity
 
             account.user_id = identity.get("real_user_id") or ""
             if not account.user_id:
@@ -482,6 +478,51 @@ class AdminService:
             raise AdminError(400, result.reason or "import failed")
         await self.pool.load()
         return {"id": result.id, "name": result.name}
+
+    async def _discover_identity(self, credential: upstream.Credential) -> Any:
+        """Read realUserID, retrying a *transient* failure before giving up.
+
+        The import probe shares the bridge's pooled client, and a burst of
+        registrations (each already holding a connection through the same proxy)
+        can leave no free connection for a few seconds — httpx raises
+        ``PoolTimeout``, and the old code turned that straight into a failed
+        import.  The token was already minted upstream, so treating "the pool was
+        briefly full" as "this account is bad" threw away a valid account.
+
+        A refusal that is genuinely about the credential (4xx, no realUserID) is
+        *not* retried: it is an answer, not a blip.  Only transport-level errors
+        back off and retry.
+        """
+        delay = 1.0
+        last: BaseException | None = None
+        for attempt in range(3):
+            try:
+                # One call for both credential kinds: the credential knows which
+                # header it authenticates with, and this endpoint is the only
+                # source of realUserID either way — it is in neither token.
+                return await self.client.fetch_user_info(credential)
+            except upstream.InvalidCredential as err:
+                return ImportResult(reason=_short(err))
+            except upstream.UpstreamError as err:
+                # A business-level refusal (bad path, rejected session) is an
+                # answer; retrying only spends another request on it.  A
+                # *redirect* is the exception: the upstream 307s an endpoint to
+                # its other deployment under load, which is a blip, and the
+                # identity read is the one call a fresh import cannot skip.
+                if not _is_redirect(err):
+                    return ImportResult(reason=_short(err))
+                last = err
+                if attempt == 2:
+                    break
+                await asyncio.sleep(delay)
+                delay *= 2
+            except Exception as err:  # noqa: BLE001 - transport; decide below
+                last = err
+                if not _is_transient(err) or attempt == 2:
+                    break
+                await asyncio.sleep(delay)
+                delay *= 2
+        return ImportResult(reason=_short(last) if last else "identity lookup failed")
 
     async def _discover_agent_id(self, credential: upstream.Credential, current: str) -> tuple[str, bool]:
         """Read the account's agent list and resolve the id it should use.
@@ -1020,3 +1061,20 @@ def _credit_fields(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _short(err: BaseException) -> str:
     return str(err)[:500]
+
+
+def _is_transient(err: BaseException) -> bool:
+    """Whether a failure is the network rather than the credential."""
+    import httpx
+
+    return isinstance(err, (httpx.TransportError, httpx.TimeoutException))
+
+
+def _is_redirect(err: BaseException) -> bool:
+    """Whether an UpstreamError is a 3xx redirect rather than a refusal.
+
+    The upstream moves an endpoint between deployments (.io <-> .com) under
+    load.  That is a blip the next attempt survives, not a verdict on the
+    account.
+    """
+    return "redirected" in str(err).lower()

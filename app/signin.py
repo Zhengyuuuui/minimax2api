@@ -40,6 +40,35 @@ from .records import (
 from .security import random_uuid
 
 
+# Reasons that mean "the network failed", not "this account is bad".  Kept as
+# substrings because the reasons are assembled from several exception texts; the
+# match is deliberately loose since a false positive only triggers one extra log
+# line, while a miss keeps the operator staring at a broken egress.
+_NETWORK_MARKERS = (
+    "timeout",
+    "timed out",
+    "connect",
+    "connection",
+    "disconnect",
+    "network",
+    "transport",
+    "unreachable",
+    "reset",
+    "proxy",
+    "502",
+    "503",
+    "504",
+)
+
+
+def _is_network_failure(outcome: "Outcome") -> bool:
+    """Whether an account's failure was the network's fault, not the account's."""
+    if outcome.status not in (SIGNIN_FAILED,):
+        return False
+    reason = (outcome.reason or "").lower()
+    return any(marker in reason for marker in _NETWORK_MARKERS)
+
+
 def _panel_of(upstream_panel: upstream.SigninPanel | None) -> SigninPanel | None:
     """Copy an upstream panel into the stored one.
 
@@ -129,11 +158,23 @@ class SigninService:
         self._settings_fn = settings_fn
         self._task: asyncio.Task[None] | None = None
         self._credit_task: asyncio.Task[None] | None = None
+        self._catchup_task: asyncio.Task[None] | None = None
         self._wakeup = asyncio.Event()
         self._running = False
         self._last_run: dict[str, Any] | None = None
         self._next_run_at: float = 0.0
         self._last_credit_run: dict[str, Any] | None = None
+        # The last check-in pass on record, when it happened, and whether a
+        # catch-up pass is currently running.  Kept for ``status()`` so the
+        # console can explain "scheduled run was missed, catching up".
+        self._last_catchup: dict[str, Any] | None = None
+        # Live progress of the current pass, for the console's progress bar.  A
+        # run walks the pool serially and can take minutes; without a counter the
+        # console can only say "running", which is indistinguishable from stuck.
+        self._progress: dict[str, Any] = {
+            "total": 0, "done": 0, "current": "", "ok": 0, "already": 0, "failed": 0,
+            "recent": [],
+        }
         # Set by server.py to the keepalive Keeper's renew_account.  Late-bound for
         # the same reason the pool's is: the keeper is built after this service.
         self.renewer: Any = None
@@ -149,6 +190,10 @@ class SigninService:
             self._credit_task = asyncio.create_task(
                 self._credit_loop(), name="minimaxcode2api-credits"
             )
+        if self._catchup_task is None:
+            self._catchup_task = asyncio.create_task(
+                self._catchup_loop(), name="minimaxcode2api-signin-catchup"
+            )
 
     async def stop(self) -> None:
         task, self._task = self._task, None
@@ -163,6 +208,13 @@ class SigninService:
             credit_task.cancel()
             try:
                 await credit_task
+            except asyncio.CancelledError:
+                pass
+        catchup_task, self._catchup_task = self._catchup_task, None
+        if catchup_task is not None:
+            catchup_task.cancel()
+            try:
+                await catchup_task
             except asyncio.CancelledError:
                 pass
 
@@ -185,6 +237,9 @@ class SigninService:
             "running": self._running,
             "nextRunAt": self.next_run_at(),
             "lastRun": self._last_run,
+            "progress": dict(self._progress),
+            "catchupEnabled": bool(getattr(self._settings_fn().signin, "catchup_enabled", True)),
+            "lastCatchup": self._last_catchup,
         }
 
     async def _loop(self) -> None:
@@ -219,6 +274,121 @@ class SigninService:
         run = await self.run_daily(account_ids)
         self._last_run = run.to_json()
         return self._last_run
+
+    # --------------------------------------------------------------- catch-up
+
+    async def _catchup_loop(self) -> None:
+        """Recover a check-in that the clock missed, once the network is back.
+
+        A scheduled pass is missed whenever the machine is asleep at the hour,
+        or the egress is down (dead proxy, dropped tunnel) — the run then fails
+        every account and books nothing.  This loop looks for exactly that case
+        and repairs it:
+          * it only acts when *no* account has a check-in recorded for today, so
+            a normal day costs nothing but a cheap DB read;
+          * it probes **one** active account first — a single request that tells
+            a recovered network apart from one that is still down;
+          * only if the probe succeeds does it sign the whole pool in, reusing
+            the ordinary pass (``already`` outcomes keep it idempotent).
+        The probe result is remembered for an hour so a still-broken network is
+        not re-tested on every tick.
+        """
+        while True:
+            settings = self._settings_fn().signin
+            interval = max(1, int(getattr(settings, "catchup_interval_min", 15))) * 60
+            try:
+                await asyncio.sleep(interval)
+                if not self._settings_fn().signin.enabled:
+                    continue
+                if not getattr(self._settings_fn().signin, "catchup_enabled", True):
+                    continue
+                if self._running:
+                    continue
+                if await self._today_covered():
+                    continue
+                await self._catchup_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - the loop must survive
+                print(f"[signin] catch-up failed: {type(err).__name__}: {err}", flush=True)
+
+    async def _today_covered(self) -> bool:
+        """True if any account already checked in today (ok/already).
+
+        That is the signal that the scheduled pass ran: a pass over the pool
+        marks every account it touched, so one success is enough to say the day
+        is handled.  A pool where everything failed books nothing and does not
+        count, which is what makes a missed, network-blocked run detectable.
+        """
+        accounts = await self._db.list_accounts()
+        today = datetime.now().date()
+        for account in accounts:
+            if not account.signin_at:
+                continue
+            if account.signin_status not in (SIGNIN_OK, SIGNIN_ALREADY):
+                continue
+            try:
+                day = datetime.fromtimestamp(float(account.signin_at)).date()
+            except (TypeError, ValueError, OSError):
+                continue
+            if day == today:
+                return True
+        return False
+
+    async def _catchup_once(self) -> None:
+        """Probe one account, then sign the whole pool in if the network is up."""
+        accounts = await self._db.list_accounts()
+        probes = [a for a in accounts if a.enabled and a.status == "active"]
+        if not probes:
+            probes = [a for a in accounts if a.enabled]
+        if not probes:
+            return
+        probe = probes[0]
+        print(
+            f"[signin] no check-in recorded today; probing {probe.name or probe.id} "
+            f"before a full catch-up",
+            flush=True,
+        )
+        try:
+            outcome = await asyncio.wait_for(
+                self.run_account(probe), timeout=self._account_budget(self._settings_fn().signin)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 - one probe only
+            self._last_catchup = {
+                "at": int(time.time()),
+                "probe": probe.id,
+                "ok": False,
+                "reason": f"{type(err).__name__}: {err}"[:200],
+            }
+            print(f"[signin] catch-up probe failed: {type(err).__name__}: {err}", flush=True)
+            return
+        ok = outcome.status in (SIGNIN_OK, SIGNIN_ALREADY)
+        self._last_catchup = {
+            "at": int(time.time()),
+            "probe": probe.id,
+            "ok": ok,
+            "reason": outcome.reason,
+        }
+        if not ok:
+            # Network is still down (or the probe account is the broken one).
+            # Do not hammer the pool; the next tick tries again.
+            print(
+                f"[signin] catch-up probe not usable ({outcome.status}: {outcome.reason}); "
+                f"will retry next interval",
+                flush=True,
+            )
+            return
+        print("[signin] probe ok — running the full catch-up check-in", flush=True)
+        run = await self.run_daily()
+        self._last_run = run.to_json()
+        counts = self._last_run.get("counts") or {}
+        print(
+            f"[signin] catch-up done: ok={counts.get(SIGNIN_OK, 0)} "
+            f"already={counts.get(SIGNIN_ALREADY, 0)} failed={counts.get(SIGNIN_FAILED, 0)}",
+            flush=True,
+        )
 
     # ------------------------------------------------------------- balance refresh
 
@@ -263,9 +433,10 @@ class SigninService:
             # Disabled accounts are refreshed too: an operator turns an account off
             # to park it, not to make its balance lie, and the number on the
             # console is what decides whether it is worth turning back on.
-            if account.region == REGION_CN:
-                skipped += 1
-                continue
+            #
+            # A mainland account is read like any other: its commerce endpoint
+            # answers the same `total_remains_credit` on the cn host, so skipping
+            # it only left the console showing a stale or absent balance.
             if wanted is not None and account.id not in wanted:
                 continue
             # A named account is always read, even if its snapshot is fresh: the
@@ -311,20 +482,50 @@ class SigninService:
     async def run_daily(self, account_ids: list[str] | None = None) -> _Run:
         run = _Run()
         self._running = True
+        network_streak = 0
         try:
             accounts = await self._db.list_accounts()
             settings = self._settings_fn().signin
             wanted = {account_id for account_id in account_ids or []} if account_ids else None
+            targets = [a for a in accounts if wanted is None or a.id in wanted]
+            # Progress is over the accounts this pass will actually walk, so the
+            # bar's denominator matches what the loop does.
+            self._progress = {
+                "total": len(targets), "done": 0, "current": "",
+                "ok": 0, "already": 0, "failed": 0,
+                "recent": [],
+            }
 
             for account in accounts:
-                if not account.enabled:
-                    continue
+                # A disabled account is still checked in.  Disabling only removes
+                # an account from *serving traffic*; its daily credit is free and
+                # expiring, so skipping it silently left the operator with a pool
+                # of accounts that looked dead purely because nobody signed them
+                # in.  Check-in is a one-request claim, not a request to route.
                 if wanted is not None and account.id not in wanted:
                     continue
+                self._progress["current"] = account.name or account.id
+                # A hard per-account ceiling.  Every network call inside has its
+                # own timeout, but a bug in any one of them (a hung renewer, a
+                # stuck DB write) would otherwise freeze the *whole* run forever
+                # — `_running` never resets, the next day's run never starts, and
+                # one bad account silently retires check-in until a restart.
+                # This is the backstop that makes "one bad account" cost one
+                # account, not the feature.
+                account_budget = self._account_budget(settings)
                 try:
-                    outcome = await self.run_account(account)
+                    outcome = await asyncio.wait_for(
+                        self.run_account(account), timeout=account_budget
+                    )
                 except asyncio.CancelledError:
                     raise
+                except asyncio.TimeoutError:
+                    outcome = Outcome(
+                        account_id=account.id,
+                        account_name=account.name or account.id,
+                        status=SIGNIN_FAILED,
+                        reason=f"account exceeded {account_budget:.0f}s budget (stuck); skipped",
+                    )
                 except Exception as err:  # noqa: BLE001 - one account only
                     outcome = Outcome(
                         account_id=account.id,
@@ -333,6 +534,44 @@ class SigninService:
                         reason=f"{type(err).__name__}: {err}"[:300],
                     )
                 run.outcomes.append(outcome)
+                # Advance the live counter.  Done is bumped for every account the
+                # loop finishes, whether it claimed, was already signed, or
+                # failed, so the bar always reaches total.
+                self._progress["done"] = self._progress.get("done", 0) + 1
+                bucket = {SIGNIN_OK: "ok", SIGNIN_ALREADY: "already"}.get(outcome.status)
+                if bucket:
+                    self._progress[bucket] = self._progress.get(bucket, 0) + 1
+                elif outcome.status == SIGNIN_FAILED:
+                    self._progress["failed"] = self._progress.get("failed", 0) + 1
+                # Feed the home page's live ticker: one line per finished account,
+                # newest last, capped so a huge pool does not grow without bound.
+                recent = self._progress.setdefault("recent", [])
+                recent.append({
+                    "name": outcome.account_name or outcome.account_id,
+                    "status": outcome.status,
+                    "points": outcome.points,
+                    "total": outcome.total,
+                })
+                del recent[:-40]
+
+                # A run of network failures (as opposed to credential or business
+                # failures) is the signal that the egress itself is wrong — a dead
+                # proxy, a dropped tunnel — and every remaining account will fail
+                # the same way.  It is called out loudly instead of scrolling past
+                # as one more line, because the fix is the network, not the pool.
+                if _is_network_failure(outcome):
+                    network_streak += 1
+                    if network_streak == 5:
+                        print(
+                            f"[signin] WARNING: {network_streak} consecutive network failures "
+                            f"(latest: {account.name or account.id}: {outcome.reason}). "
+                            f"Egress looks broken — check the proxy / network before "
+                            f"the next run.",
+                            flush=True,
+                        )
+                else:
+                    network_streak = 0
+
                 # Paced on purpose: a burst of parallel check-ins from one address
                 # is exactly the pattern that gets accounts flagged.
                 if settings.gap_seconds > 0:
@@ -340,6 +579,21 @@ class SigninService:
         finally:
             self._running = False
         return run
+
+    @staticmethod
+    def _account_budget(settings: Any) -> float:
+        """Hard ceiling for one account's check-in, in seconds.
+
+        Generous relative to a healthy account (a few seconds), because the
+        useful failures here are slow networks, not fast bugs — but bounded, so
+        a genuinely stuck account is skipped instead of freezing the run.  Its
+        own method so a test can pin it without waiting out the real budget.
+        """
+        try:
+            base = float(settings.timeout_sec)
+        except (TypeError, ValueError):
+            base = 30.0
+        return max(60.0, base * 6)
 
     async def run_account(self, account: Account) -> Outcome:
         """Check one account in, renewing once if the credential is refused.
@@ -352,16 +606,45 @@ class SigninService:
         reported as a real failure.
         """
         preflight = Outcome(account_id=account.id, account_name=account.name or account.id)
-        if account.region == REGION_CN:
-            preflight.reason = "mainland region, no check-in service"
+        # The mainland deployment answers the same status/claim endpoints as the
+        # international one, so a cn account checks in like any other.  The gate
+        # stays because an operator may know their mainland accounts cannot, and
+        # then the skip is a deliberate choice rather than a silent one.
+        if account.region == REGION_CN and not self._settings_fn().signin.check_in_cn:
+            preflight.reason = "mainland check-in disabled (signin.check_in_cn)"
             return await _record_outcome(self._db, self._pool, account, preflight)
 
         try:
             return await self._attempt(account)
         except upstream.InvalidCredential as err:
             refused = str(err)
+        except asyncio.TimeoutError as err:
+            # A slow or unreachable network must fail *this account*, not the
+            # whole run and not the HTTP request that triggered it.  `_prepare`
+            # normalises its own timeout to an UpstreamError, but the status and
+            # claim calls use a bare `wait_for` and would otherwise escape here.
+            timeout_outcome = Outcome(account_id=account.id, account_name=account.name or account.id)
+            timeout_outcome.status = SIGNIN_FAILED
+            timeout_outcome.reason = f"network timeout during check-in: {err or 'no response'}"[:300]
+            return await _record_outcome(self._db, self._pool, account, timeout_outcome)
 
-        if not await self._renew(account):
+        renewal = await self._renew(account)
+        renewed_ok = bool(renewal is not None and getattr(renewal, "ok", False))
+        if not renewed_ok:
+            # A transport failure is not a verdict on the credential.  When the
+            # renewal could not even reach the network, the account is left as it
+            # was and reported as skipped, not failed: the next run (or the
+            # keepalive sweep) gets another chance, and a temporary outage must
+            # not look like a dead account.  `None` means no renewer is wired at
+            # all (a setup gap, still not the credential's fault).
+            transient = bool(renewal is not None and getattr(renewal, "transient", False))
+            if transient or renewal is None:
+                preflight.status = SIGNIN_SKIPPED
+                preflight.reason = (
+                    f"renewal could not reach the network ({refused}); will retry"
+                    if transient else f"credential refused and no renewer is wired ({refused})"
+                )
+                return await _record_outcome(self._db, self._pool, account, preflight)
             preflight.status = SIGNIN_FAILED
             preflight.reason = f"credential refused, not renewable: {refused}"[:300]
             return await _record_outcome(self._db, self._pool, account, preflight)
@@ -380,8 +663,15 @@ class SigninService:
             retry.reason = f"credential refused even after renewal: {err}"[:300]
             return await _record_outcome(self._db, self._pool, fresh, retry)
 
-    async def _renew(self, account: Account) -> bool:
-        """Renew one account's credential; report whether it is usable again.
+    async def _renew(self, account: Account) -> Any:
+        """Renew one account's credential; return the renewal result.
+
+        Returns the ``RenewResult`` (or ``None`` when there is nothing to renew
+        with) rather than a bare bool, because the caller has to tell two
+        outcomes apart: a credential the upstream *refused* is dead, but a
+        transport failure (a blinking proxy, a dropped tunnel) says nothing about
+        the credential at all.  Collapsing both into "not renewable" is what
+        marked healthy accounts failed when the network hiccuped mid-renewal.
 
         Deliberately does not reload the pool: a daily run holds leases, and a
         reload would rebuild the cache under them.  The database is the record —
@@ -391,12 +681,16 @@ class SigninService:
         use a dead one again.
         """
         if self.renewer is None:
-            return False
+            return None
         try:
-            result = await self.renewer(account.id)
+            # Bounded: a renewal that hangs must not stall the run.  The renewer
+            # does its own network with a 30s client timeout, so 90s is generous
+            # headroom against a slow proxy while still guaranteeing this returns.
+            return await asyncio.wait_for(self.renewer(account.id), timeout=90.0)
+        except asyncio.TimeoutError:
+            return None
         except Exception:  # noqa: BLE001 - a renewer that raises is "no renewal"
-            return False
-        return bool(result is not None and getattr(result, "ok", False))
+            return None
 
     async def _attempt(self, account: Account) -> Outcome:
         """One check-in pass against a credential presumed usable.
@@ -485,6 +779,14 @@ class SigninService:
             prepared = await asyncio.wait_for(self._client.prepare(credential), timeout=timeout * 3)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError as err:
+            # `wait_for` raises the *builtin* TimeoutError, not an UpstreamError,
+            # so it used to escape every handler and surface as a raw 500 in the
+            # console.  A slow network is an ordinary per-account outcome, not a
+            # crash: report it as this account's failure and let the run continue.
+            raise upstream.UpstreamError(
+                f"prepare timed out after {timeout * 3:.0f}s (network slow or unreachable)"
+            ) from err
         except upstream.UpstreamError:
             # A failure here is recorded as the day's outcome by the caller's
             # handler: the account simply does not check in today.

@@ -99,7 +99,11 @@ class UpstreamSettings:
     desktop_screen_width: int = 1800
     desktop_screen_height: int = 1169
     request_timeout_sec: int = 300
-    stream_idle_timeout_sec: int = 120
+    # How long a streamed turn may go silent before it is treated as stalled.
+    # Long enough for a model that thinks before its first token, short enough
+    # that a wedged connection surfaces as an error rather than leaving the
+    # client waiting until its own timeout fires ("response truncated").
+    stream_idle_timeout_sec: int = 45
     # Required for the international site: every business call behind it is
     # fenced to overseas egress, and a direct call answers a bare 401.
     proxy: str = ""
@@ -115,6 +119,11 @@ class RoutingSettings:
     capacity_wait_sec: int = 20
     sticky_ttl_sec: int = 300
     prefer_idle: bool = True
+    # Prefer accounts from one region when both are available.  "" leaves the
+    # pool region-agnostic; "cn" makes mainland accounts answer first while
+    # still falling back to global ones, so a request never fails for lack of a
+    # region.
+    region_priority: str = ""
 
 
 @dataclass
@@ -145,6 +154,16 @@ class SigninSettings:
     timeout_sec: int = 30
     skip_zero_credit: bool = False
     credit_fresh_min: int = 360
+    # Whether mainland (cn) accounts are checked in.  They are, by default: the
+    # mainland deployment now answers the same status/claim endpoints as the
+    # international one.  Left as a switch because only an operator can confirm
+    # the mainland behaviour from their accounts.
+    check_in_cn: bool = True
+    # If the scheduled check-in never happened (machine was off, or the network
+    # was down at that hour), catch up later the same day: probe one account,
+    # and if the network is back, sign the whole pool in.
+    catchup_enabled: bool = True
+    catchup_interval_min: int = 15
     # How often a background pass re-reads balances that have gone stale.  Short
     # on purpose: the console's balance is what an operator trusts, and a number
     # that quietly disagrees with the website is worse than none.
@@ -400,6 +419,8 @@ def normalize(settings: Settings, data_dir: str) -> bool:
     routing = settings.routing
     if routing.strategy not in STRATEGIES:
         routing.strategy = default.routing.strategy
+    if routing.region_priority not in ("", "cn", "global"):
+        routing.region_priority = default.routing.region_priority
     routing.cooldown_base_sec = max(1, routing.cooldown_base_sec)
     routing.cooldown_max_sec = max(routing.cooldown_base_sec, routing.cooldown_max_sec)
     routing.max_attempts = _int_range(routing.max_attempts, 1, 20, default.routing.max_attempts)
@@ -422,6 +443,9 @@ def normalize(settings: Settings, data_dir: str) -> bool:
     signin.gap_seconds = max(0, signin.gap_seconds)
     signin.timeout_sec = max(5, signin.timeout_sec)
     signin.credit_fresh_min = max(1, signin.credit_fresh_min)
+    signin.catchup_interval_min = _int_range(
+        signin.catchup_interval_min, 1, 1440, default.signin.catchup_interval_min
+    )
     signin.credit_refresh_min = max(0, signin.credit_refresh_min)
     signin.device_memory = max(1, signin.device_memory)
     signin.cpu_core_num = max(1, signin.cpu_core_num)
