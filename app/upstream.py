@@ -105,7 +105,17 @@ MAX_JSON_BODY = 1 << 20
 
 
 class UpstreamError(RuntimeError):
-    """Any failure that is not a dead credential."""
+    """Any failure that is not a dead credential.
+
+    ``retryable`` is a structured answer to "could the very same call plausibly
+    succeed if tried again?".  A transport blip or a 307 is; a refusal is an
+    answer and must not be retried.  Callers test the flag rather than matching
+    the message, so rewording an error can never silently change retry policy.
+    """
+
+    def __init__(self, *args: Any, retryable: bool = False) -> None:
+        super().__init__(*args)
+        self.retryable = retryable
 
 
 class InvalidCredential(UpstreamError):
@@ -403,7 +413,23 @@ def redact(text: str, cred: Credential) -> str:
 
 
 def _safe_transport_error(err: BaseException, cred: Credential) -> UpstreamError:
-    return UpstreamError(redact(f"{type(err).__name__}: {err}", cred))
+    """Wrap a transport failure, keeping "was it the network's fault" intact.
+
+    The distinction matters to callers: a connection reset is worth another
+    attempt, while a decode or protocol error of our own making is not.  Once
+    the exception is wrapped the caller can only see ``UpstreamError``, so the
+    flag has to be decided here, from the original type.
+    """
+    transient = isinstance(
+        err,
+        (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            httpx.ProxyError,
+        ),
+    )
+    return UpstreamError(redact(f"{type(err).__name__}: {err}", cred), retryable=transient)
 
 
 def _int_of(value: Any) -> int:
@@ -823,11 +849,24 @@ class MiniMaxClient:
     def __init__(self, settings_fn: Callable[[], Settings]) -> None:
         self._settings_fn = settings_fn
         self._clients: dict[str, httpx.AsyncClient] = {}
+        # Clients that were taken out of the cache while requests were still in
+        # flight on them, mapped to the task that will close them once the grace
+        # period has passed.
+        self._retiring: dict[asyncio.Task[None], httpx.AsyncClient] = {}
 
     async def aclose(self) -> None:
-        clients, self._clients = self._clients, {}
-        for client in clients.values():
-            await client.aclose()
+        retiring, self._retiring = self._retiring, {}
+        for task in retiring:
+            task.cancel()
+        if retiring:
+            await asyncio.gather(*retiring, return_exceptions=True)
+        clients = list(retiring.values()) + list(self._clients.values())
+        self._clients = {}
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 - closing a broken client is best-effort
+                pass
 
     async def _drop_client(self, key: str) -> None:
         """Retire a cached client whose connection pool has gone bad.
@@ -835,14 +874,50 @@ class MiniMaxClient:
         A socket the upstream closed without telling us looks reusable until a
         request stalls on it.  When that happens the whole pool can be poisoned
         — every later request borrows the same dead socket — so the client is
-        discarded instead of trusted again; the next call builds a fresh one.
+        removed from the cache and the next call builds a fresh one.
+
+        The retired client is *not* closed on the spot.  It is shared by every
+        account on that route, so an immediate ``aclose`` would cut the streams
+        that are perfectly healthy right now; the operator would trade one dead
+        request for a burst of truncated ones.  Closing is therefore deferred by
+        a grace period as long as the longest possible request, after which no
+        request can still be running on it.
         """
         client = self._clients.pop(key, None)
-        if client is not None:
-            try:
-                await client.aclose()
-            except Exception:  # noqa: BLE001 - closing a broken client is best-effort
-                pass
+        if client is None:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._close_after(client, self._retire_grace())
+        )
+        self._retiring[task] = client
+        # A cancelled reaper must not take its client with it: the entry stays
+        # for `aclose` to deal with, so a shutdown never leaks a connection pool.
+        task.add_done_callback(
+            lambda done, held=self._retiring: held.pop(done, None) if not done.cancelled() else None
+        )
+
+    async def _close_after(self, client: httpx.AsyncClient, grace: float) -> None:
+        """Close a retired client once nothing can still be using it."""
+        try:
+            await asyncio.sleep(grace)
+        except asyncio.CancelledError:
+            raise
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001 - closing a broken client is best-effort
+            pass
+
+    def _retire_grace(self) -> float:
+        """How long to wait before closing a retired client, in seconds.
+
+        The longest a single request can legitimately live: past that, every
+        request that borrowed the client has finished (or been timed out), so
+        closing it cannot truncate anything.
+        """
+        try:
+            return max(60.0, float(self._settings_fn().upstream.request_timeout_sec))
+        except Exception:  # noqa: BLE001 - settings unavailable is not fatal here
+            return 300.0
 
     # ---------------------------------------------------------------- addressing
 
@@ -1115,28 +1190,39 @@ class MiniMaxClient:
         headers = self._llm_headers(cred)
         if stream:
             headers["accept"] = "text/event-stream"
-        client = self._client_for(settings, self.base_url(settings, cred))
+        # The cache key is the *host*, never the full base URL: `is_loopback`
+        # compares names, and passing a URL would make the proxied and direct
+        # keys disagree with the ones `_drop_client` computes below.
+        host = urlsplit(url).hostname or ""
+        client = self._client_for(settings, host)
         request = client.build_request(
             "POST", url, headers=headers,
             content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             timeout=timeout,
         )
+        # Bound the *header* wait separately from the body.  `timeout` above
+        # governs the whole request and is minutes long because a stream can
+        # legitimately run that long — but the response headers should arrive
+        # in seconds.  If they do not, the connection is dead (a reused
+        # keep-alive socket the upstream already closed is the usual cause)
+        # and waiting the full read timeout is what the client sees as "wait
+        # for response, first token never comes".  Failing fast here lets the
+        # caller retry on a fresh connection instead.
+        ttfb = min(45.0, float(timeout)) if timeout else 45.0
         try:
-            # Bound the *header* wait separately from the body.  `timeout` above
-            # governs the whole request and is minutes long because a stream can
-            # legitimately run that long — but the response headers should arrive
-            # in seconds.  If they do not, the connection is dead (a reused
-            # keep-alive socket the upstream already closed is the usual cause)
-            # and waiting the full read timeout is what the client sees as "wait
-            # for response, first token never comes".  Failing fast here lets the
-            # caller retry on a fresh connection instead.
-            ttfb = min(45.0, float(timeout)) if timeout else 45.0
             response = await asyncio.wait_for(client.send(request, stream=stream), timeout=ttfb)
         except asyncio.TimeoutError as err:
             # The pool is poisoned: drop the client so the retry connects anew
             # instead of borrowing the same dead socket again.
-            await self._drop_client(self._client_key(settings, urlsplit(url).hostname or ""))
+            await self._drop_client(self._client_key(settings, host))
             raise UpstreamError(f"upstream sent no response headers within {ttfb:.0f}s") from err
+        except httpx.PoolTimeout as err:
+            # Every connection this route may open is busy.  That is back
+            # pressure, not a dead pool: dropping the client would cut the
+            # streams that are holding the connections, so it is left alone.
+            raise UpstreamError(
+                f"upstream connection pool exhausted for {host} (all connections busy)"
+            ) from err
         except httpx.HTTPError as err:
             raise _safe_transport_error(err, cred) from err
         if response.status_code in (401, 403):
@@ -1189,8 +1275,14 @@ class MiniMaxClient:
                 # removes the entire class of stale-socket failures.  Streaming
                 # still works: a single request's connection lives for the whole
                 # stream; it is only *reuse across requests* that is disabled.
+                #
+                # `max_connections` must stay above the pool's real concurrency
+                # (accounts x their max_concurrent), because every account on
+                # this route shares this one client: a limit below that turns
+                # ordinary load into `PoolTimeout`, and a starved request is
+                # indistinguishable from a broken one at the caller.
                 "limits": httpx.Limits(
-                    max_connections=64,
+                    max_connections=256,
                     max_keepalive_connections=0,
                     keepalive_expiry=0.0,
                 ),
@@ -1219,16 +1311,16 @@ class MiniMaxClient:
     def _timeout(settings: Settings) -> httpx.Timeout:
         # The connect side is short and the read side generous: a stream turn can
         # legitimately take minutes to produce its first token, while a proxy or
-        # DNS failure should surface immediately.  The pool wait is generous on
-        # purpose: a burst of registrations all egress through one proxy, and a
-        # request that briefly has no free connection should wait rather than
-        # fail — a `PoolTimeout` here once cost a freshly registered account its
-        # only import attempt.
+        # DNS failure should surface immediately.  The pool wait is deliberately
+        # *shorter* than the response-header budget: a request that cannot get a
+        # connection must raise `PoolTimeout` (reported as back pressure, the
+        # client is kept) instead of being cancelled by the header deadline and
+        # mistaken for a dead connection.
         return httpx.Timeout(
             connect=15.0,
             read=float(settings.upstream.request_timeout_sec),
             write=30.0,
-            pool=90.0,
+            pool=40.0,
         )
 
     def _headers(self, settings: Settings, cred: Credential, target: Target) -> dict[str, str]:
@@ -1299,6 +1391,12 @@ class MiniMaxClient:
             raise UpstreamError(
                 f"upstream sent no response headers within {header_budget:.0f}s"
             ) from err
+        except httpx.PoolTimeout as err:
+            # Back pressure, not a dead pool: see `llm`.  Worth one retry.
+            raise UpstreamError(
+                f"upstream connection pool exhausted for {host} (all connections busy)",
+                retryable=True,
+            ) from err
 
     async def _read_json(self, cred: Credential, target: Target, label: str) -> dict[str, Any]:
         """Issue a signed JSON call and decode the envelope."""
@@ -1314,17 +1412,20 @@ class MiniMaxClient:
             # A redirect is not an answer.  The upstream occasionally 307s the
             # identity endpoints to its other deployment (`.io` → `.com`), which
             # leaves an empty body; falling through made that read as a plain
-            # "not JSON" and cost a freshly registered account its import, when
-            # the real cause was a host that will not serve a foreign token.
-            # Reported as a transport error, so the caller retries (and the
-            # pending-signup recovery picks it up) instead of declaring the
-            # account dead.
+            # "not JSON" and would retire a perfectly good credential over a
+            # host that simply will not serve a foreign token.
+            #
+            # 307/308 preserve method and body, so a retry can land on the new
+            # host and succeed: they are marked retryable.  301/302/303 are not
+            # — retrying those changes what the request means, and a permanent
+            # move must surface as such instead of being masked by retries.
             if response.status_code in (301, 302, 303, 307, 308):
                 location = response.headers.get("location", "")
                 raise UpstreamError(
                     f"minimax {label} redirected ({response.status_code}"
                     f"{' -> ' + location if location else ''}); "
-                    f"the endpoint moved and this token does not apply there"
+                    f"the endpoint moved and this token does not apply there",
+                    retryable=response.status_code in (307, 308),
                 )
             raw = (await response.aread()).decode("utf-8", "replace")
             if response.status_code >= 400:

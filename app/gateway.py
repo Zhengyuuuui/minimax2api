@@ -279,6 +279,12 @@ class Gateway:
 
         try:
             response = await self._run_llm(upstream_body, trace, stream=False)
+            # The non-streamed twin of the streaming path's first-frame mark:
+            # headers arriving is when the upstream started answering.  Without
+            # it the audit column read 0 for every non-streamed turn, which is
+            # exactly the case "wait for response" complaints come from.
+            if not trace.first_token_ms:
+                trace.first_token_ms = int((time.time() - trace.started_at) * 1000)
             raw = await response.aread()
             await response.aclose()
         except upstream.InvalidCredential as err:

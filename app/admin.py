@@ -482,16 +482,15 @@ class AdminService:
     async def _discover_identity(self, credential: upstream.Credential) -> Any:
         """Read realUserID, retrying a *transient* failure before giving up.
 
-        The import probe shares the bridge's pooled client, and a burst of
-        registrations (each already holding a connection through the same proxy)
-        can leave no free connection for a few seconds — httpx raises
-        ``PoolTimeout``, and the old code turned that straight into a failed
-        import.  The token was already minted upstream, so treating "the pool was
-        briefly full" as "this account is bad" threw away a valid account.
+        The import probe shares the bridge's pooled client, so a busy pool can
+        leave no free connection for a few seconds — httpx raises
+        ``PoolTimeout``, and turning that straight into a failed import threw
+        away a credential that was already valid upstream.
 
         A refusal that is genuinely about the credential (4xx, no realUserID) is
-        *not* retried: it is an answer, not a blip.  Only transport-level errors
-        back off and retry.
+        *not* retried: it is an answer, not a blip.  Only errors the upstream
+        layer marked ``retryable`` (a transport blip, or a 307 to the other
+        deployment) back off and retry.
         """
         delay = 1.0
         last: BaseException | None = None
@@ -504,12 +503,10 @@ class AdminService:
             except upstream.InvalidCredential as err:
                 return ImportResult(reason=_short(err))
             except upstream.UpstreamError as err:
-                # A business-level refusal (bad path, rejected session) is an
-                # answer; retrying only spends another request on it.  A
-                # *redirect* is the exception: the upstream 307s an endpoint to
-                # its other deployment under load, which is a blip, and the
-                # identity read is the one call a fresh import cannot skip.
-                if not _is_redirect(err):
+                # Whether another attempt could help is the exception's own
+                # answer, not a substring of its message: the retry policy must
+                # not silently change when someone rewords an error.
+                if not getattr(err, "retryable", False):
                     return ImportResult(reason=_short(err))
                 last = err
                 if attempt == 2:
@@ -1068,13 +1065,3 @@ def _is_transient(err: BaseException) -> bool:
     import httpx
 
     return isinstance(err, (httpx.TransportError, httpx.TimeoutException))
-
-
-def _is_redirect(err: BaseException) -> bool:
-    """Whether an UpstreamError is a 3xx redirect rather than a refusal.
-
-    The upstream moves an endpoint between deployments (.io <-> .com) under
-    load.  That is a blip the next attempt survives, not a verdict on the
-    account.
-    """
-    return "redirected" in str(err).lower()

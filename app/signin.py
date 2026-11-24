@@ -69,6 +69,12 @@ def _is_network_failure(outcome: "Outcome") -> bool:
     return any(marker in reason for marker in _NETWORK_MARKERS)
 
 
+# How long a *failed* catch-up probe is trusted before the network is tested
+# again.  A long outage then costs one request an hour instead of one per tick,
+# which matters because the probe is a real check-in attempt.
+_CATCHUP_PROBE_MEMO_SEC = 3600.0
+
+
 def _panel_of(upstream_panel: upstream.SigninPanel | None) -> SigninPanel | None:
     """Copy an upstream panel into the stored one.
 
@@ -164,6 +170,10 @@ class SigninService:
         self._last_run: dict[str, Any] | None = None
         self._next_run_at: float = 0.0
         self._last_credit_run: dict[str, Any] | None = None
+        # One pass at a time: the scheduler, the console's "run now" and the
+        # catch-up loop all drive `run_daily`, and the pool must not be walked
+        # twice concurrently.
+        self._run_lock = asyncio.Lock()
         # The last check-in pass on record, when it happened, and whether a
         # catch-up pass is currently running.  Kept for ``status()`` so the
         # console can explain "scheduled run was missed, catching up".
@@ -290,7 +300,7 @@ class SigninService:
             a recovered network apart from one that is still down;
           * only if the probe succeeds does it sign the whole pool in, reusing
             the ordinary pass (``already`` outcomes keep it idempotent).
-        The probe result is remembered for an hour so a still-broken network is
+        A *failed* probe is remembered for an hour so a still-broken network is
         not re-tested on every tick.
         """
         while True:
@@ -306,11 +316,31 @@ class SigninService:
                     continue
                 if await self._today_covered():
                     continue
+                if self._probe_recently_failed():
+                    continue
                 await self._catchup_once()
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 - the loop must survive
                 print(f"[signin] catch-up failed: {type(err).__name__}: {err}", flush=True)
+
+    def _probe_recently_failed(self) -> bool:
+        """Whether a failed probe is recent enough to still be trusted.
+
+        The network being down is not a per-tick question: re-testing it every
+        ``catchup_interval_min`` turns an outage into a stream of check-in
+        attempts on a live account.  A *successful* probe is deliberately not
+        remembered — that path signs the whole pool in straight away, and that
+        pass's own bookkeeping decides whether anything is still owed.
+        """
+        last = self._last_catchup
+        if not last or last.get("ok"):
+            return False
+        try:
+            at = float(last.get("at") or 0)
+        except (TypeError, ValueError):
+            return False
+        return (time.time() - at) < _CATCHUP_PROBE_MEMO_SEC
 
     async def _today_covered(self) -> bool:
         """True if any account already checked in today (ok/already).
@@ -480,6 +510,12 @@ class SigninService:
     # ------------------------------------------------------------------- the run
 
     async def run_daily(self, account_ids: list[str] | None = None) -> _Run:
+        # Serialized.  A scheduled pass, a manual "run now" and a catch-up pass
+        # all walk the same pool, and two at once would claim twice from the
+        # same account — the one pattern the pacing below exists to avoid —
+        # while overwriting each other's progress counters and clearing
+        # ``_running`` while the other is still going.
+        await self._run_lock.acquire()
         run = _Run()
         self._running = True
         network_streak = 0
@@ -578,6 +614,7 @@ class SigninService:
                     await asyncio.sleep(settings.gap_seconds)
         finally:
             self._running = False
+            self._run_lock.release()
         return run
 
     @staticmethod

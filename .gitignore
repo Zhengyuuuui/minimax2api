@@ -20,3 +20,13 @@ generated/
 .env
 .env.*
 !.env.example
+
+# local-only snapshots of experimental work, kept out of the source tree so an
+# accidental `git add -A` cannot publish them.
+/archive/
+
+# Captured traffic and recorded runs.  They contain live Authorization /
+# Bearer / cookie material and are never part of the source tree.
+*.out
+/scripts/capture.py
+/scripts/walk_recorder.py

@@ -103,6 +103,10 @@ class UpstreamSettings:
     # Long enough for a model that thinks before its first token, short enough
     # that a wedged connection surfaces as an error rather than leaving the
     # client waiting until its own timeout fires ("response truncated").
+    #
+    # Note for existing installs: `normalize` only raises a value that is too
+    # small, so a settings.json written while the default was 120 keeps 120.
+    # Lower it by hand (or from the console) to get the new behaviour.
     stream_idle_timeout_sec: int = 45
     # Required for the international site: every business call behind it is
     # fenced to overseas egress, and a direct call answers a bare 401.
